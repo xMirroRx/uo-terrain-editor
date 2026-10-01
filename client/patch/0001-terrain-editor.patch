@@ -1,0 +1,740 @@
+diff --git a/src/ClassicUO.Client/Game/GameObjects/Views/LandView.cs b/src/ClassicUO.Client/Game/GameObjects/Views/LandView.cs
+index e9b8bcb2c..ebae700cd 100644
+--- a/src/ClassicUO.Client/Game/GameObjects/Views/LandView.cs
++++ b/src/ClassicUO.Client/Game/GameObjects/Views/LandView.cs
+@@ -99,6 +99,8 @@ namespace ClassicUO.Game.GameObjects
+                         hueVec,
+                         depth + LAND_DEPTH_OFFSET
+                     );
++
++                    DrawOverlay(batcher, posX, posY, depth);
+                 }
+                 else
+                 {
+@@ -162,12 +164,130 @@ namespace ClassicUO.Game.GameObjects
+                         depth + LAND_DEPTH_OFFSET
+                     );
+ 
++                    DrawSoftEdges(batcher, posX, posY, depth);
++                    DrawOverlay(batcher, posX, posY, depth);
+                 }
+             }
+ 
+             return true;
+         }
+ 
++        /// <summary>
++        /// MyShard: editörle döşenmiş bir karenin kenarını yumuşatır. Komşu karede başka bir zemin varsa, o
++        /// zeminin solgun bir kopyası ortak kenarda opak, kareye doğru sönerek bu karenin üstüne çizilir.
++        /// Yalnızca BİZİM döşediğimiz karelerin üstüne çizilir: UO'nun kendi dünyası hiç değişmez.
++        /// </summary>
++        private void DrawSoftEdges(UltimaBatcher2D batcher, int posX, int posY, float depth)
++        {
++            if (World?.Map == null || !Managers.TerrainBlendManager.IsCustomGround(Graphic))
++            {
++                return;
++            }
++
++            Vector3 blendHue = ShaderHueTranslator.GetHueVector(0, false, 1f);
++            var pos = new Vector2(posX, posY);
++            int myGroup = Managers.TerrainBlendManager.GetGroup(Graphic);
++
++            for (int side = 0; side < Managers.TerrainBlendManager.SIDE_QTY; side++)
++            {
++                int nx = X, ny = Y;
++
++                switch (side)
++                {
++                    case Managers.TerrainBlendManager.SIDE_WEST: nx--; break;
++                    case Managers.TerrainBlendManager.SIDE_NORTH: ny--; break;
++                    case Managers.TerrainBlendManager.SIDE_EAST: nx++; break;
++                    case Managers.TerrainBlendManager.SIDE_SOUTH: ny++; break;
++                    case Managers.TerrainBlendManager.SIDE_NW: nx--; ny--; break;
++                    case Managers.TerrainBlendManager.SIDE_NE: nx++; ny--; break;
++                    case Managers.TerrainBlendManager.SIDE_SE: nx++; ny++; break;
++                    default: nx--; ny++; break;
++                }
++
++                GameObject obj = World.Map.GetTile(nx, ny, false);
++                Land neighbour = null;
++
++                while (obj != null)
++                {
++                    if (obj is Land land)
++                    {
++                        neighbour = land;
++
++                        break;
++                    }
++
++                    obj = obj.TNext;
++                }
++
++                // Aynı zemin türüyse karıştırılacak bir şey yok (bir setin bütün parçaları tek zemindir).
++                if (neighbour == null || Managers.TerrainBlendManager.GetGroup(neighbour.Graphic) == myGroup)
++                {
++                    continue;
++                }
++
++                Texture2D edge = Managers.TerrainBlendManager.GetEdge(batcher.GraphicsDevice, neighbour.Graphic, side);
++
++                if (edge == null)
++                {
++                    continue;
++                }
++
++                batcher.Draw(
++                    edge,
++                    pos,
++                    null,
++                    blendHue,
++                    0f,
++                    Vector2.Zero,
++                    Vector2.One,
++                    SpriteEffects.None,
++                    // Zeminin belirgin biçimde üstünde ama bir sonraki nesnenin altında: daha küçük bir fark
++                    // derinlik tamponunda çakışıp yürürken titremeye yol açıyordu.
++                    depth + LAND_DEPTH_OFFSET + 0.25f
++                );
++            }
++        }
++
++
++        /// <summary>
++        /// MyShard serpme katmanı: bu karenin zemininin ÜSTÜNE serpilmiş kum/çakıl/taş. Zemin grafiğini
++        /// değiştirmez, saydam olduğu için altındaki döşeme arasından görünmeye devam eder.
++        /// </summary>
++        private void DrawOverlay(UltimaBatcher2D batcher, int posX, int posY, float depth)
++        {
++            if (World?.Map == null)
++            {
++                return;
++            }
++
++            ushort graphic = Managers.TerrainOverlayManager.Get(World.Map.Index, X, Y);
++
++            if (graphic == 0)
++            {
++                return;
++            }
++
++            Texture2D sprite = Managers.TerrainOverlayManager.GetSprite(graphic);
++
++            if (sprite == null)
++            {
++                return;
++            }
++
++            batcher.Draw(
++                sprite,
++                new Vector2(posX, posY),
++                null,
++                ShaderHueTranslator.GetHueVector(0, false, 1f),
++                0f,
++                Vector2.Zero,
++                Vector2.One,
++                SpriteEffects.None,
++                // Zeminin ve kenar yumuşatmasının üstünde, bir sonraki nesnenin altında.
++                depth + LAND_DEPTH_OFFSET + 0.4f
++            );
++        }
++
+         public override bool CheckMouseSelection()
+         {
+             if (IsStretched)
+diff --git a/src/ClassicUO.Client/Game/Managers/SpellEffectsManager.cs b/src/ClassicUO.Client/Game/Managers/SpellEffectsManager.cs
+index 1b520d33e..5f7b96da9 100644
+--- a/src/ClassicUO.Client/Game/Managers/SpellEffectsManager.cs
++++ b/src/ClassicUO.Client/Game/Managers/SpellEffectsManager.cs
+@@ -2931,6 +2931,142 @@ namespace ClassicUO.Game.Managers
+                 p.RealScreenPosition.Y + (p.Offset.Y - p.Offset.Z) + 22 + (dx + dy) * 22 - (wz - p.Z) * 4);
+         }
+ 
++
++        // ----- MyShard terrain editor: the brush outline on the ground, so the size and the soft edge of
++        // the brush are visible before painting. Drawn at the tile under the mouse cursor. -----
++        public static void DrawTerrainBrushCursor(UltimaBatcher2D batcher, World world)
++        {
++            if (!UI.Gumps.TerrainEditorGump.IsEditing || world?.Map == null || world.Player == null)
++            {
++                return;
++            }
++
++            if (!UIManager.IsMouseOverWorld)
++            {
++                return;
++            }
++
++            if (SelectedObject.Object is not GameObject tile)
++            {
++                return;
++            }
++
++            EnsureFxTextures();
++
++            Vector2 center = TileScreen(world, (ushort)tile.X, (ushort)tile.Y, tile.Z);
++            float tiles = UI.Gumps.TerrainEditorGump.BrushRadius + 0.5f;
++            float rx = tiles * 22f * 1.41421356f;
++            float ry = rx * 0.92f;   // referanstaki imleç neredeyse tam daire, zeminin 2:1 izdüşümü değil
++
++            Color color = UI.Gumps.TerrainEditorGump.CurrentTool switch
++            {
++                UI.Gumps.TerrainEditorGump.TerrainTool.Paint => new Color(120, 200, 255),
++                UI.Gumps.TerrainEditorGump.TerrainTool.Revert => new Color(255, 170, 120),
++                _ => new Color(150, 255, 170)   // the height tools
++            };
++
++            int softness = UI.Gumps.TerrainEditorGump.EdgeSoftness;
++
++            if (UI.Gumps.TerrainEditorGump.SquareBrush)
++            {
++                DrawTileDiamond(batcher, world, tile, UI.Gumps.TerrainEditorGump.BrushRadius, color, 0.85f);
++
++                return;
++            }
++
++            // Referanstaki imleç: içeride yumuşak mavimsi-beyaz bir parıltı, üstünde ince ve keskin beyaz
++            // bir halka. Parıltı ortada en güçlü, halkaya doğru sönüyor.
++            Texture2D disc = GetBrushDisc(batcher.GraphicsDevice);
++
++            if (disc != null)
++            {
++                batcher.Draw(
++                    disc,
++                    new Rectangle((int)(center.X - rx), (int)(center.Y - ry), (int)(rx * 2f), (int)(ry * 2f)),
++                    null,
++                    ShaderHueTranslator.GetHueVector(0, false, 1f),
++                    0f,
++                    Vector2.Zero,
++                    SpriteEffects.None,
++                    0f
++                );
++            }
++
++            // Halka: tek geçiş, ince ve net beyaz (referansta parlama yok, keskin bir çizgi var).
++            DrawEllipseRing(batcher, center, rx, ry, new Random(1), 0f, Color.White, 0f, 0.95f, 2f);
++
++            // Where the brush still applies at full strength: everything between the two rings is the part
++            // that fades out (edge softness).
++            if (softness > 0)
++            {
++                float band = (softness / 100f) * Math.Min(UI.Gumps.TerrainEditorGump.BrushRadius + 0.5f, 6f);
++                float coreScale = Math.Max(0f, (UI.Gumps.TerrainEditorGump.BrushRadius + 0.5f - band) / (UI.Gumps.TerrainEditorGump.BrushRadius + 0.5f));
++
++                if (coreScale > 0.08f)
++                {
++                    DrawEllipseRing(batcher, center, rx * coreScale, ry * coreScale, new Random(1), 0f, color, 0.15f, 0.40f, 2f);
++                }
++            }
++        }
++
++        // The soft disc under the brush, built once: white in the middle, fading to nothing at the rim.
++        private static Texture2D _brushDisc;
++
++        private static Texture2D GetBrushDisc(GraphicsDevice device)
++        {
++            if (_brushDisc != null && !_brushDisc.IsDisposed)
++            {
++                return _brushDisc;
++            }
++
++            const int SIZE = 128;
++            const float R = SIZE / 2f;
++
++            var data = new Color[SIZE * SIZE];
++
++            for (int y = 0; y < SIZE; y++)
++            {
++                for (int x = 0; x < SIZE; x++)
++                {
++                    float dx = (x - R + 0.5f) / R;
++                    float dy = (y - R + 0.5f) / R;
++                    float d = (float)Math.Sqrt((dx * dx) + (dy * dy));
++
++                    if (d >= 1f)
++                    {
++                        continue;
++                    }
++
++                    // Ortada en güçlü, kenara doğru sönen mavimsi-beyaz parıltı (referansla aynı his).
++                    float a = (float)Math.Pow(1f - d, 1.6) * 0.38f;
++
++                    byte alpha = (byte)Math.Clamp(a * 255f, 0, 255);
++                    data[(y * SIZE) + x] = new Color((byte)(200 * a), (byte)(220 * a), (byte)(250 * a), alpha);
++                }
++            }
++
++            _brushDisc = new Texture2D(device, SIZE, SIZE);
++            _brushDisc.SetData(data);
++
++            return _brushDisc;
++        }
++
++        // Outline of a square brush: the four corners of the area, in isometric screen space.
++        private static void DrawTileDiamond(UltimaBatcher2D batcher, World world, GameObject tile, int radius, Color color, float alpha)
++        {
++            int x = tile.X, y = tile.Y;
++            sbyte z = tile.Z;
++
++            Vector2 c1 = TileScreen(world, (ushort)(x - radius), (ushort)(y - radius), z);
++            Vector2 c2 = TileScreen(world, (ushort)(x + radius + 1), (ushort)(y - radius), z);
++            Vector2 c3 = TileScreen(world, (ushort)(x + radius + 1), (ushort)(y + radius + 1), z);
++            Vector2 c4 = TileScreen(world, (ushort)(x - radius), (ushort)(y + radius + 1), z);
++
++            DrawSolidLine(batcher, c1, c2, 3f, color, alpha);
++            DrawSolidLine(batcher, c2, c3, 3f, color, alpha);
++            DrawSolidLine(batcher, c3, c4, 3f, color, alpha);
++            DrawSolidLine(batcher, c4, c1, 3f, color, alpha);
++        }
+         // ----- MyShard click-to-move marker: an orange double-ring on the target tile that converges
+         // outside->inward, so the player sees where they clicked and that they'll walk there. -----
+         private static bool _pfActive;
+diff --git a/src/ClassicUO.Client/Game/Scenes/GameScene.cs b/src/ClassicUO.Client/Game/Scenes/GameScene.cs
+index a3027e0a2..c344e12ff 100644
+--- a/src/ClassicUO.Client/Game/Scenes/GameScene.cs
++++ b/src/ClassicUO.Client/Game/Scenes/GameScene.cs
+@@ -866,6 +866,15 @@ namespace ClassicUO.Game.Scenes
+             UpdateTargetHud();
+             UpdateCityRegion();
+ 
++            // MyShard terrain editor: holding the button over one spot keeps the brush flowing.
++            if (TerrainEditorGump.IsEditing
++                && Input.Mouse.LButtonPressed
++                && UIManager.IsMouseOverWorld
++                && SelectedObject.Object is GameObject brushTile)
++            {
++                TerrainEditorGump.ApplyFlow(_world, brushTile.X, brushTile.Y);
++            }
++
+ 
+             // Check if we're waiting for window resize to complete
+             if (_waitingForWindowResize)
+@@ -1619,6 +1628,7 @@ namespace ClassicUO.Game.Scenes
+             SpellEffectsManager.DrawSpiritStacks(batcher, _world);
+             Managers.BuffBarManager.DrawRising(batcher, _world);
+             SpellEffectsManager.DrawPathfindMarker(batcher, _world);
++            SpellEffectsManager.DrawTerrainBrushCursor(batcher, _world);
+             SpellEffectsManager.DrawCastAura(batcher, _world);
+             Managers.GmAnnounceManager.Draw(batcher, _world);
+ 
+diff --git a/src/ClassicUO.Client/Game/Scenes/GameSceneInputHandler.cs b/src/ClassicUO.Client/Game/Scenes/GameSceneInputHandler.cs
+index 338dec0bf..c428e2024 100644
+--- a/src/ClassicUO.Client/Game/Scenes/GameSceneInputHandler.cs
++++ b/src/ClassicUO.Client/Game/Scenes/GameSceneInputHandler.cs
+@@ -44,6 +44,7 @@ namespace ClassicUO.Game.Scenes
+         internal void ToggleAutoWalk(bool? on = true) => _continueRunning = on.HasValue ? on.Value : !_continueRunning;
+ 
+         private ushort _lastMouseTileX = 0xFFFF, _lastMouseTileY = 0xFFFF;
++        private ushort _lastTerrainPaintX = 0xFFFF, _lastTerrainPaintY = 0xFFFF;
+         private bool _mouseTileSent;
+ 
+         // Reports the tile under the mouse cursor to the server (custom 0x12 sub-command 0xCE).
+@@ -495,6 +496,17 @@ namespace ClassicUO.Game.Scenes
+                 return true;
+             }
+ 
++            // MyShard terrain editor: while its window is open, clicking the ground paints instead of
++            // walking / picking up. Dragging keeps painting, see OnMouseDragging.
++            if (TerrainEditorGump.IsEditing && SelectedObject.Object is GameObject terrainTarget)
++            {
++                TerrainEditorGump.ApplyAt(_world, terrainTarget.X, terrainTarget.Y);
++                _lastTerrainPaintX = terrainTarget.X;
++                _lastTerrainPaintY = terrainTarget.Y;
++                _isMouseLeftDown = true;
++                return true;
++            }
++
+             SelectedObject.LastLeftDownObject = SelectedObject.Object;
+ 
+             if (ProfileManager.CurrentProfile.EnableDragSelect && DragSelectModifierActive())
+@@ -1355,6 +1367,27 @@ namespace ClassicUO.Game.Scenes
+                 return false;
+             }
+ 
++            // MyShard terrain editor: keep painting while the button is held. A new tile paints at once,
++            // holding still keeps the brush flowing (see TerrainEditorGump.ApplyFlow).
++            if (TerrainEditorGump.IsEditing && Mouse.LButtonPressed)
++            {
++                if (SelectedObject.Object is GameObject terrainTarget)
++                {
++                    if (terrainTarget.X != _lastTerrainPaintX || terrainTarget.Y != _lastTerrainPaintY)
++                    {
++                        TerrainEditorGump.ApplyAt(_world, terrainTarget.X, terrainTarget.Y);
++                        _lastTerrainPaintX = terrainTarget.X;
++                        _lastTerrainPaintY = terrainTarget.Y;
++                    }
++                    else
++                    {
++                        TerrainEditorGump.ApplyFlow(_world, terrainTarget.X, terrainTarget.Y);
++                    }
++                }
++
++                return true;
++            }
++
+             bool ok = true;
+ 
+             if (Mouse.LButtonPressed && !Client.Game.UO.GameCursor.ItemHold.Enabled)
+diff --git a/src/ClassicUO.Client/Game/UI/Controls/ModernScrollBar.cs b/src/ClassicUO.Client/Game/UI/Controls/ModernScrollBar.cs
+index dbe9c327e..b21ab5a75 100644
+--- a/src/ClassicUO.Client/Game/UI/Controls/ModernScrollBar.cs
++++ b/src/ClassicUO.Client/Game/UI/Controls/ModernScrollBar.cs
+@@ -59,6 +59,10 @@ namespace ClassicUO.Game.UI.Controls
+             if (Height <= 0 || !IsVisible)
+                 return false;
+ 
++            // Değer veya aralık dışarıdan değiştiğinde de tutamaç doğru yerde olsun (eskiden yalnızca
++            // yükseklik değişince hesaplanıyordu, bu yüzden tekerlekle kaydırınca tutamaç yerinde kalıyordu).
++            CalculateThumbRect();
++
+             Color trackColor = TrackColor;
+             Color upButtonColor = _btUpClicked ? ButtonPressedColor : ButtonColor;
+             Color downButtonColor = _btDownClicked ? ButtonPressedColor : ButtonColor;
+diff --git a/src/ClassicUO.Client/Game/UltimaLive.cs b/src/ClassicUO.Client/Game/UltimaLive.cs
+index ab61c6b5b..500c1473f 100644
+--- a/src/ClassicUO.Client/Game/UltimaLive.cs
++++ b/src/ClassicUO.Client/Game/UltimaLive.cs
+@@ -60,6 +60,32 @@ namespace ClassicUO.Game
+ 
+             switch (command)
+             {
++                case 0xF0: // MyShard: serpme katmanı bloğu (zeminin üstündeki kum/çakıl/taş)
++                {
++                    // Bu paket harita dosyalarına hiç dokunmaz, o yüzden canlı zemin kipi de gerekmez:
++                    // blok bellekte tutulur ve kareler çizilirken zeminin üstüne konur.
++                    if (p.Length < 143)
++                    {
++                        return;
++                    }
++
++                    p.Seek(3);
++                    int overlayBlock = (int)p.ReadUInt32BE();
++                    p.Seek(14);
++                    int overlayMap = p.ReadUInt8();
++
++                    var tiles = new ushort[64];
++
++                    for (int i = 0; i < 64; i++)
++                    {
++                        tiles[i] = p.ReadUInt16BE();
++                    }
++
++                    Managers.TerrainOverlayManager.SetBlock(overlayMap, overlayBlock, tiles);
++
++                    return;
++                }
++
+                 case 0xFF: //hash query, for the blocks around us
+                 {
+                     if (_UL == null || p.Length < 15)
+@@ -307,6 +333,7 @@ namespace ClassicUO.Game
+                         //UIManager.GetGump<WorldMapGump>()?.UpdateMap();
+                         //instead of recalculating the CRC block 2 times, in case of terrain + statics update, we only set the actual block to ushort maxvalue, so it will be recalculated on next hash query
+                         //also the server should always send FIRST the landdata packet, and only AFTER land the statics packet
++                        _UL.EnsureMapCRCs(mapId);
+                         _UL.MapCRCs[mapId][block] = ushort.MaxValue;
+                     }
+ 
+@@ -370,7 +397,12 @@ namespace ClassicUO.Game
+                     }
+ 
+                     //previously there were a minor amount of maps
+-                    if (_UL._ValidMaps.Count == 0 || validMaps.Count > _UL._ValidMaps.Count || !validMaps.TrueForAll(i => _UL._ValidMaps.Contains(i)))
++                    // Rebuild the loader when the map list changed, and also when a previous attempt left us
++                    // without usable file handles - otherwise every later terrain update is dropped.
++                    bool filesMissing = _UL._filesMap == null
++                                        || validMaps.Exists(i => i >= _UL._filesMap.Length || _UL._filesMap[i] == null);
++
++                    if (filesMissing || _UL._ValidMaps.Count == 0 || validMaps.Count > _UL._ValidMaps.Count || !validMaps.TrueForAll(i => _UL._ValidMaps.Contains(i)))
+                     {
+                         _UL._ValidMaps = validMaps;
+                         MapLoader.MAPS_COUNT = sbyte.MaxValue;
+@@ -461,11 +493,35 @@ namespace ClassicUO.Game
+                 return;
+             }
+ 
++            // The server can push a terrain block before this client finished setting up its own map
++            // files (or when that setup failed). Drop the update instead of crashing the client.
++            if (_UL?._filesMap == null || mapId >= _UL._filesMap.Length || _UL._filesMap[mapId] == null)
++            {
++                Log.Warn($"UltimaLive: terrain update for map {mapId} arrived before the map files were ready, ignoring it.");
++
++                return;
++            }
++
++            // The checksum cache is normally filled by the server's hash query; a server that only pushes
++            // updates never sends one, so make sure the array for this map exists.
++            _UL.EnsureMapCRCs(mapId);
++
+             ushort mapWidthInBlocks = (ushort) Client.Game.UO.FileManager.Maps.MapBlocksSize[mapId, 0];
+             ushort mapHeightInBlocks = (ushort) Client.Game.UO.FileManager.Maps.MapBlocksSize[mapId, 1];
+ 
+             if (block >= 0 && block < mapWidthInBlocks * mapHeightInBlocks)
+             {
++                // The server has no way of knowing what this client already has, so the same block can
++                // arrive again (on login, or when walking back into an area). Rewriting it and rebuilding
++                // the chunks around it makes the ground flicker for no reason, so identical data is dropped.
++                Span<byte> current = stackalloc byte[LAND_BLOCK_LENGTH];
++                _UL._filesMap[mapId].ReadAt(block * 196 + 4, current);
++
++                if (current.SequenceEqual(landData))
++                {
++                    return;
++                }
++
+                 _UL._filesMap[mapId].WriteArray(block * 196 + 4, landData);
+ 
+                 //instead of recalculating the CRC block 2 times, in case of terrain + statics update, we only set the actual block to ushort maxvalue, so it will be recalculated on next hash query
+@@ -601,6 +657,39 @@ namespace ClassicUO.Game
+             return (ushort) ((sum2 << 8) | sum1);
+         }
+ 
++        /// <summary>
++        /// Makes sure the per-block checksum cache of a map exists. It is normally created when the server
++        /// asks for block hashes; a server that only pushes updates never asks, so create it on demand.
++        /// </summary>
++        private void EnsureMapCRCs(int mapId)
++        {
++            if (MapCRCs == null || mapId < 0 || mapId >= MapCRCs.Length)
++            {
++                return;
++            }
++
++            if (MapCRCs[mapId] != null)
++            {
++                return;
++            }
++
++            int blocks = Client.Game.UO.FileManager.Maps.MapBlocksSize[mapId, 0] * Client.Game.UO.FileManager.Maps.MapBlocksSize[mapId, 1];
++
++            if (blocks <= 0)
++            {
++                return;
++            }
++
++            var crcs = new ushort[blocks];
++
++            for (int i = 0; i < blocks; i++)
++            {
++                crcs[i] = ushort.MaxValue;
++            }
++
++            MapCRCs[mapId] = crcs;
++        }
++
+         private static string ValidatePath(string shardName)
+         {
+             try
+@@ -787,7 +876,9 @@ namespace ClassicUO.Game
+ 
+             public override void Load()
+             {
+-                if (Client.Game.UO.FileManager.Maps is ULMapLoader)
++                // Only skip when this very loader is already installed: a newly built one must load, even if
++                // the previous loader was an UltimaLive one, or it ends up with no open map files at all.
++                if (ReferenceEquals(Client.Game.UO.FileManager.Maps, this))
+                 {
+                     return;
+                 }
+@@ -869,57 +960,29 @@ namespace ClassicUO.Game
+ 
+                 if (!File.Exists(mapPath))
+                 {
+-                    FileReader mapFile = GetMapFile(mapId);
+-
+-                    if (mapFile == null)
++                    // A plain .mul install: just copy the real map file. We must not fall through to
++                    // CreateNewPersistentMap here, that writes a blank world: this loader's file list is
++                    // not populated yet, so GetMapFile() always returns null at this point.
++                    if (File.Exists(oldMap))
+                     {
+-                        // if (!File.Exists(staticsPath) && File.Exists(oldStatics))
+-                        // {
+-                        //     CopyFile(oldStatics, staticsPath);
+-                        // }
+-
+-                        // if (!File.Exists(staIdxPath) && File.Exists(oldStaIdx))
+-                        // {
+-                        //     CopyFile(oldStaIdx, staIdxPath);
+-                        // }
+-
+-                        CreateNewPersistentMap(mapId, mapPath, staIdxPath, staticsPath);
++                        CopyFile(oldMap, mapPath);
++                    }
++                    else if (GetMapFile(mapId) is UOFileUop)
++                    {
++                        Log.Error($"UltimaLive: map{mapId} is in UOP format, live terrain updates are not supported for it.");
+                     }
+                     else
+                     {
+-                        if (mapFile is UOFileUop uop)
+-                        {
+-                            //Entries[mapId] = new UOFileIndex[uop.TotalEntriesCount];
+-                            //uop.FillEntries(ref Entries[mapId]);
+-
+-                            //Log.Trace($"UltimaLive -> converting file:\t{mapPath} from {uop.FilePath}");
+-
+-                            //using (FileStream stream = File.Create(mapPath))
+-                            //{
+-                            //    var reader = uop.GetReader();
+-                            //    for (int x = 0; x < Entries[mapId].Length; x++)
+-                            //    {
+-                            //        reader.Seek(Entries[mapId][x].Offset);
+-
+-                            //        stream.Write(reader.ReadArray(Entries[mapId][x].Length), 0, Entries[mapId][x].Length);
+-                            //    }
+-
+-                            //    stream.Flush();
+-                            //}
+-                        }
+-                        else
+-                        {
+-                            CopyFile(oldMap, mapPath);
+-                        }
++                        CreateNewPersistentMap(mapId, mapPath, staIdxPath, staticsPath);
+                     }
+                 }
+ 
+-                if (!File.Exists(staticsPath))
++                if (!File.Exists(staticsPath) && File.Exists(oldStatics))
+                 {
+                     CopyFile(oldStatics, staticsPath);
+                 }
+ 
+-                if (!File.Exists(staIdxPath))
++                if (!File.Exists(staIdxPath) && File.Exists(oldStaIdx))
+                 {
+                     CopyFile(oldStaIdx, staIdxPath);
+                 }
+diff --git a/src/ClassicUO.Client/Network/OutgoingPackets.cs b/src/ClassicUO.Client/Network/OutgoingPackets.cs
+index b72871b37..c8fafc3df 100644
+--- a/src/ClassicUO.Client/Network/OutgoingPackets.cs
++++ b/src/ClassicUO.Client/Network/OutgoingPackets.cs
+@@ -1206,6 +1206,127 @@ namespace ClassicUO.Network
+             writer.Dispose();
+         }
+ 
++        // MyShard terrain editor: one brush stroke (custom 0x12 sub-command 0xCD). The server applies it to the
++        // world and pushes the changed map blocks back to the clients. Staff only, checked server side.
++        public static void Send_TerrainEdit(this AsyncNetClient socket, byte tool, ushort x, ushort y, ushort tileId, byte radius, byte flags, sbyte z, byte softness, byte setSize, byte shape, ushort variantMid, byte variantMidSet, ushort variantLow, byte variantLowSet)
++        {
++            const byte ID = 0x12;
++
++            int length = AsyncNetClient.PacketsTable.GetPacketLength(ID);
++
++            var writer = new StackDataWriter(length < 0 ? 24 : length);
++
++            writer.WriteUInt8(ID);
++
++            if (length < 0)
++            {
++                writer.WriteZero(2);
++            }
++
++            writer.WriteUInt8(0xCD); // sub-command 205
++            writer.WriteUInt8(tool);
++            writer.WriteUInt16LE(x);
++            writer.WriteUInt16LE(y);
++            writer.WriteUInt16LE(tileId);
++            writer.WriteUInt8(radius);
++            writer.WriteUInt8(flags);
++            writer.WriteUInt8((byte)z);
++            writer.WriteUInt8(softness);
++            writer.WriteUInt8(setSize);
++            writer.WriteUInt8(shape);
++            writer.WriteUInt16LE(variantMid);
++            writer.WriteUInt8(variantMidSet);
++            writer.WriteUInt16LE(variantLow);
++            writer.WriteUInt8(variantLowSet);
++
++            if (length < 0)
++            {
++                writer.Seek(1, SeekOrigin.Begin);
++                writer.WriteUInt16BE((ushort)writer.BytesWritten);
++            }
++            else
++            {
++                writer.WriteZero(length - writer.BytesWritten);
++            }
++
++            socket.Send(writer.BufferWritten);
++            writer.Dispose();
++        }
++
++        // MyShard terrain editor: a command without a brush (custom 0x12 sub-command 0xCC).
++
++        // MyShard dekorasyon fırçası (0x12 alt komut 0xCB): ağaç, kaya, moloz gibi nesneleri serper ya da
++        // daha önce serptiklerimizi siler.
++        public static void Send_TerrainDecor(this AsyncNetClient socket, ushort x, ushort y, ushort itemId, byte radius, byte flags, byte density, byte shape)
++        {
++            const byte ID = 0x12;
++
++            int length = AsyncNetClient.PacketsTable.GetPacketLength(ID);
++
++            var writer = new StackDataWriter(length < 0 ? 24 : length);
++
++            writer.WriteUInt8(ID);
++
++            if (length < 0)
++            {
++                writer.WriteZero(2);
++            }
++
++            writer.WriteUInt8(0xCB); // sub-command 203
++            writer.WriteUInt16LE(x);
++            writer.WriteUInt16LE(y);
++            writer.WriteUInt16LE(itemId);
++            writer.WriteUInt8(radius);
++            writer.WriteUInt8(flags);
++            writer.WriteUInt8(density);
++            writer.WriteUInt8(shape);
++
++            if (length < 0)
++            {
++                writer.Seek(1, SeekOrigin.Begin);
++                writer.WriteUInt16BE((ushort)writer.BytesWritten);
++            }
++            else
++            {
++                writer.WriteZero(length - writer.BytesWritten);
++            }
++
++            socket.Send(writer.BufferWritten);
++            writer.Dispose();
++        }
++        // action 0 = undo the last stroke, 1 = save the terrain edits now.
++        public static void Send_TerrainCommand(this AsyncNetClient socket, byte action)
++        {
++            const byte ID = 0x12;
++
++            int length = AsyncNetClient.PacketsTable.GetPacketLength(ID);
++
++            var writer = new StackDataWriter(length < 0 ? 16 : length);
++
++            writer.WriteUInt8(ID);
++
++            if (length < 0)
++            {
++                writer.WriteZero(2);
++            }
++
++            writer.WriteUInt8(0xCC); // sub-command 204
++            writer.WriteUInt8(action);
++
++            if (length < 0)
++            {
++                writer.Seek(1, SeekOrigin.Begin);
++                writer.WriteUInt16BE((ushort)writer.BytesWritten);
++            }
++            else
++            {
++                writer.WriteZero(length - writer.BytesWritten);
++            }
++
++            socket.Send(writer.BufferWritten);
++            writer.Dispose();
++        }
++
+         public static void Send_OpenDoor(this AsyncNetClient socket)
+         {
+             const byte ID = 0x12;

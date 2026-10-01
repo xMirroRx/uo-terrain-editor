@@ -1,0 +1,85 @@
+0x1000 16 black irregular cobblestone
+0x1100 16 obsidian square pavers
+0x1200 16 charcoal castle brick
+0x1300 16 ancient cracked flagstone
+0x1400 16 wet black stone
+0x1500 16 volcanic basalt
+0x1600 16 blue gray fortress cobble
+0x1700 16 moss veined dark stone
+0x1800 16 cemetery cracked stone
+0x1900 16 ash gray granite cobble
+0x1A00 16 brown medieval road cobble
+0x1B00 16 weathered sandstone courtyard
+0x1C00 16 worn gray marble slabs
+0x1D00 8 frosted slate paving
+0x1D40 8 arcane midnight stone
+0x1D80 8 swamp stained flagstone
+0x1DC0 8 dark red brick paving
+0x1E00 8 old dark oak planks
+0x1E40 8 forest ruin stone earth
+0x1E80 8 pale keep limestone
+0x1EC0 8 lush britannian grass
+0x1F00 8 dark forest grass
+0x1F40 8 dry autumn grass
+0x1F80 8 trampled meadow grass
+0x1FC0 8 swampy marsh grass
+0x2000 8 black irregular cobblestone 65
+0x2040 8 black irregular cobblestone 35
+0x2080 8 obsidian square pavers 65
+0x20C0 8 obsidian square pavers 35
+0x2100 8 charcoal castle brick 65
+0x2140 8 charcoal castle brick 35
+0x2180 8 ancient cracked flagstone 65
+0x21C0 8 ancient cracked flagstone 35
+0x2200 8 wet black stone 65
+0x2240 8 wet black stone 35
+0x2280 8 volcanic basalt 65
+0x22C0 8 volcanic basalt 35
+0x2300 8 blue gray fortress cobble 65
+0x2340 8 blue gray fortress cobble 35
+0x2380 8 moss veined dark stone 65
+0x23C0 8 moss veined dark stone 35
+0x2400 8 cemetery cracked stone 65
+0x2440 8 cemetery cracked stone 35
+0x2480 8 ash gray granite cobble 65
+0x24C0 8 ash gray granite cobble 35
+0x2500 8 brown medieval road cobble 65
+0x2540 8 brown medieval road cobble 35
+0x2580 8 weathered sandstone courtyard 65
+0x25C0 8 weathered sandstone courtyard 35
+0x2600 8 worn gray marble slabs 65
+0x2640 8 worn gray marble slabs 35
+0x3200 8 fine golden sand scatter
+0x3240 8 coarse sand and grit
+0x3280 8 light river pebbles
+0x32C0 8 dark gravel scatter
+0x3300 8 mixed stone chips
+0x3340 8 large worn stones cluster
+0x3380 8 dust and stone crumbs
+0x33C0 8 mossy pebbles scatter
+0x3400 8 volcanic cinder scatter
+0x3440 8 pale limestone chips
+0x27D0 8 frosted slate paving 65
+0x2810 8 frosted slate paving 35
+0x2850 8 arcane midnight stone 65
+0x2890 8 arcane midnight stone 35
+0x28D0 8 swamp stained flagstone 65
+0x2910 8 swamp stained flagstone 35
+0x2950 8 dark red brick paving 65
+0x2990 8 dark red brick paving 35
+0x29D0 8 old dark oak planks 65
+0x2A10 8 old dark oak planks 35
+0x2A50 8 forest ruin stone earth 65
+0x2A90 8 forest ruin stone earth 35
+0x2AD0 8 pale keep limestone 65
+0x2B10 8 pale keep limestone 35
+0x2B50 8 lush britannian grass 65
+0x2B90 8 lush britannian grass 35
+0x2BD0 8 dark forest grass 65
+0x2C10 8 dark forest grass 35
+0x2C50 8 dry autumn grass 65
+0x2C90 8 dry autumn grass 35
+0x2CD0 8 trampled meadow grass 65
+0x2D10 8 trampled meadow grass 35
+0x2D50 8 swampy marsh grass 65
+0x2D90 8 swampy marsh grass 35

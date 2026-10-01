@@ -1,0 +1,1723 @@
+diff --git a/src/CMakeSources.cmake b/src/CMakeSources.cmake
+index f7502190..fbdf226b 100644
+--- a/src/CMakeSources.cmake
++++ b/src/CMakeSources.cmake
+@@ -156,6 +156,7 @@ set(common_S
+     src/common/CLocalVarsExtra.cpp
+     src/common/CLog.cpp
+     src/common/CServerMap.cpp
++    src/common/CServerMapEdits.cpp
+     src/common/CUID.cpp
+     src/common/CPointBase.cpp
+     src/common/CRect.cpp
+@@ -186,6 +187,7 @@ set(common_H
+     src/common/CLocalVarsExtra.h
+     src/common/CLog.h
+     src/common/CServerMap.h
++    src/common/CServerMapEdits.h
+     src/common/CUID.h
+     src/common/CPointBase.h
+     src/common/CRect.h
+diff --git a/src/common/CServerMap.cpp b/src/common/CServerMap.cpp
+index 7a34074e..dc78e964 100644
+--- a/src/common/CServerMap.cpp
++++ b/src/common/CServerMap.cpp
+@@ -5,6 +5,7 @@
+ //#include "CException.h" // included in the precompiled header
+ #include "CUOInstall.h"
+ #include "CServerMap.h"
++#include "CServerMapEdits.h"
+ #include "../game/uo_files/CUOItemInfo.h"
+ #include "../game/uo_files/CUOMultiItemRec.h"
+ #include "../game/uo_files/CUOStaticItemRec.h"
+@@ -426,6 +427,42 @@ bool CServerStaticsBlock::IsStaticPoint( uint i, int xo, int yo ) const
+ 
+ size_t CServerMapBlock::sm_iCount = 0;
+ 
++
++bool ReadTerrainBlockFromMul(int iMap, dword uiBlockIndex, CUOMapBlock& block)
++{
++	ADDTOCALLSTACK("ReadTerrainBlockFromMul");
++	// Reads a terrain block straight from mapX.mul, ignoring the runtime edits: this is what the
++	// terrain editor restores with RESET, also for blocks edited before we started keeping copies.
++	if (!g_MapList.IsMapSupported(iMap))
++		return false;
++
++	const int iMapNumber = g_MapList.GetMapFileNum(iMap);
++	CSFile* pFile = &(g_Install.m_Maps[iMapNumber]);
++	if ((pFile == nullptr) || !pFile->IsFileOpen())
++		return false;
++
++	CUOIndexRec index;
++	index.SetupIndex(uiBlockIndex * sizeof(CUOMapBlock), sizeof(CUOMapBlock));
++
++	dword fileOffset = index.GetFileOffset();
++	if (g_Install.m_IsMapUopFormat[iMapNumber])
++	{
++		for (int i = 0; i < MAP_SUPPORTED_QTY; ++i)
++		{
++			MapAddress pMapAddress = g_Install.m_UopMapAddress[iMapNumber][i];
++			if ((uiBlockIndex <= pMapAddress.dwLastBlock) && (uiBlockIndex >= pMapAddress.dwFirstBlock))
++			{
++				fileOffset = (dword)(pMapAddress.qwAdress + ((uiBlockIndex - pMapAddress.dwFirstBlock) * 196LL));
++				break;
++			}
++		}
++	}
++
++	if ((uint)pFile->Seek(fileOffset, SEEK_SET) != fileOffset)
++		return false;
++
++	return (pFile->Read(&block, sizeof(CUOMapBlock)) > 0);
++}
+ void CServerMapBlock::Load( int bx, int by )
+ {
+ 	ADDTOCALLSTACK("CServerMapBlock::Load");
+@@ -465,6 +502,13 @@ void CServerMapBlock::Load( int bx, int by )
+ 		}
+ 	}
+ 
++	// Runtime terrain edits (in-game terrain editor) always win over the mul/dif data.
++	if ( const CUOMapBlock * pEditedBlock = g_MapEdits.GetBlock(m_map, uiBlockIndex) )
++	{
++		memcpy( &m_Terrain, pEditedBlock, sizeof(CUOMapBlock) );
++		fPatchedTerrain = true;
++	}
++
+ 	// Only load terrain if it wasn't patched
+ 	if ( ! fPatchedTerrain )
+ 	{
+diff --git a/src/common/CServerMap.h b/src/common/CServerMap.h
+index 5167a5b3..8a0b2f3c 100644
+--- a/src/common/CServerMap.h
++++ b/src/common/CServerMap.h
+@@ -198,6 +198,9 @@ public:
+ 	const CUOMapMeter* GetTerrain(int xo, int yo) const;
+ };
+ 
++// Reads one terrain block straight from mapX.mul, ignoring any runtime edit (used by the terrain editor RESET).
++bool ReadTerrainBlockFromMul(int iMap, dword uiBlockIndex, CUOMapBlock& block);
++
+ class CUOMulti : private CCachedMulItem
+ {
+ 	// Load all the relivant info for the
+diff --git a/src/common/sphereproto.h b/src/common/sphereproto.h
+index b9bbb908..ef8e4997 100644
+--- a/src/common/sphereproto.h
++++ b/src/common/sphereproto.h
+@@ -54,7 +54,7 @@ enum XCMD_TYPE	// XCMD_* messages are unique in both directions.
+ 	XCMD_VendorBuy		= 0x3b,
+ 	XCMD_Content		= 0x3c,
+ 	XCMD_StaticUpdate	= 0x3f,
+-	//	0x40
++	XCMD_UpdateTerrain	= 0x40,
+ 	XCMD_LightPoint		= 0x4e,
+ 	XCMD_Light			= 0x4f,
+ 	//	0x50
+diff --git a/src/game/CWorld.cpp b/src/game/CWorld.cpp
+index 24ac186b..4f3795af 100644
+--- a/src/game/CWorld.cpp
++++ b/src/game/CWorld.cpp
+@@ -3,6 +3,7 @@
+ //#include "../common/CScriptParserBufs.h" // included in the precompiled header via CExpression.h
+ #include "../common/CLog.h"
+ #include "../common/sphereversion.h"
++#include "../common/CServerMapEdits.h"
+ #include "../network/CClientIterator.h"
+ #include "../network/CNetworkManager.h"
+ #include "../sphere/ProfileTask.h"
+@@ -874,7 +875,15 @@ bool CWorld::SaveStage() // Save world state in stages.
+ 	}
+ 	else if ( _iSaveStage == iSectorsQty +1 )
+ 	{
+-		//	Empty save stage
++		// Save the runtime terrain edits (in-game terrain editor), if there is anything new.
++		if ( g_MapEdits.IsDirty() )
++		{
++			CSString sTerrainName;
++			sTerrainName.Format("%s" SPHERE_FILE "terrain.bin", static_cast<lpctstr>(g_Cfg.m_sWorldBaseDir));
++			fRc = g_MapEdits.Save(sTerrainName.GetBuffer());
++			if ( fRc )
++				g_Log.Event(LOGM_SAVE, "Terrain edits saved (%s).\n", sTerrainName.GetBuffer());
++		}
+ 	}
+ 	else if ( _iSaveStage == iSectorsQty +2 )
+ 	{
+@@ -1459,6 +1468,13 @@ bool CWorld::LoadAll() // Load world from script
+     // start count (will grow as needed).
+ 	_GameClock.Init();		// will be loaded from the world file.
+ 
++	// Load the runtime terrain edits (in-game terrain editor) before anything touches the map blocks.
++	{
++		CSString sTerrainName;
++		sTerrainName.Format("%s" SPHERE_FILE "terrain.bin", static_cast<lpctstr>(g_Cfg.m_sWorldBaseDir));
++		g_MapEdits.Load(sTerrainName.GetBuffer());
++	}
++
+ 	// Load all the accounts.
+ 	if ( !g_Accounts.Account_LoadAll(false) )
+ 		return false;
+@@ -1813,6 +1829,10 @@ void CWorld::_OnTick()
+ 		Save(false);
+ 	}
+ 
++	// Feed the clients the terrain blocks that were edited around them.
++	EXC_SET_BLOCK("Terrain updates");
++	CWorldMap::TickTerrainUpdates();
++
+ 	// Update map cache
+ 	if (_Cache._iTimeLastMapBlockCacheCheck < iCurTime)
+ 	{
+diff --git a/src/game/CWorldMap.cpp b/src/game/CWorldMap.cpp
+index f14ebe12..50ccb323 100644
+--- a/src/game/CWorldMap.cpp
++++ b/src/game/CWorldMap.cpp
+@@ -19,6 +19,18 @@
+ #include "CWorldCache.h"
+ #include "CWorldSearch.h"
+ #include "CWorldMap.h"
++#include <cmath>
++#include <set>
++#include <unordered_map>
++#include <vector>
++#include "clients/CClient.h"
++#include "../common/CServerMapEdits.h"
++#include "CServerConfig.h"
++#include "CWorldGameTime.h"
++#include "../common/CUOInstall.h"
++#include "../common/sphere_library/CSFileText.h"
++#include "../network/CClientIterator.h"
++#include "../network/send.h"
+ 
+ //************************
+ // Natural resources.
+@@ -293,6 +305,959 @@ const CServerMapBlock* CWorldMap::GetMapBlock(const CPointMap& pt) // static
+     return nullptr;
+ }
+ 
++//************************
++// Terrain editing (in-game terrain editor).
++
++void CWorldMap::InvalidateMapBlock(int iMap, int iBx, int iBy) noexcept // static
++{
++	// Drop a cached map block, so that it gets re-read (and re-patched) on the next access.
++	if ((iMap < 0) || (iMap >= MAP_SUPPORTED_QTY) || !g_MapList.IsInitialized(iMap))
++		return;
++	if (!g_World._Cache._mapBlocks[iMap])
++		return;
++
++	const int iBXMax = g_MapList.GetMapSizeX(iMap) / UO_BLOCK_SIZE;
++	const int iBYMax = g_MapList.GetMapSizeY(iMap) / UO_BLOCK_SIZE;
++	if ((iBx < 0) || (iBx >= iBXMax) || (iBy < 0) || (iBy >= iBYMax))
++		return;
++
++	g_World._Cache._mapBlocks[iMap][(iBy * iBXMax) + iBx].reset();
++}
++
++// How far from a client a changed block still matters. Terrain beyond this is not drawn, and the client
++// picks it up later anyway (see CWorldMap::TickTerrainUpdates).
++#define TERRAIN_SEND_RANGE_BLOCKS	6
++
++static bool TerrainBlockNearChar(const CChar* pChar, int iMap, dword dwBlockIdx, int iRangeBlocks)
++{
++	if ((pChar == nullptr) || (pChar->GetTopMap() != iMap))
++		return false;
++
++	const int iBYMax = g_MapList.GetMapSizeY(iMap) / UO_BLOCK_SIZE;
++	if (iBYMax <= 0)
++		return false;
++
++	const int iBx = (int)(dwBlockIdx / (dword)iBYMax);
++	const int iBy = (int)(dwBlockIdx % (dword)iBYMax);
++	const CPointMap pt = pChar->GetTopPoint();
++
++	return ((abs(iBx - (pt.m_x / UO_BLOCK_SIZE)) <= iRangeBlocks) &&
++			(abs(iBy - (pt.m_y / UO_BLOCK_SIZE)) <= iRangeBlocks));
++}
++
++void CWorldMap::SendTerrainBlockUpdate(int iMap, dword dwBlockIdx, const CUOMapBlock* pBlock) // static
++{
++	ADDTOCALLSTACK("CWorldMap::SendTerrainBlockUpdate");
++	// Push the new terrain block to the clients which can actually see it. A block is 201 bytes, and a
++	// brush stroke touches up to four of them several times a second, so sending them to everyone on the
++	// map would be a lot of traffic for terrain nobody is looking at.
++	if (pBlock == nullptr)
++		return;
++
++	ClientIterator it;
++	for (CClient* pClient = it.next(); pClient != nullptr; pClient = it.next())
++	{
++		if (!pClient->m_fUltimaLive)
++			continue;
++
++		const CChar* pChar = pClient->GetChar();
++		if (!TerrainBlockNearChar(pChar, iMap, dwBlockIdx, TERRAIN_SEND_RANGE_BLOCKS))
++			continue;
++
++		new PacketUpdateTerrain(pClient, dwBlockIdx, pBlock, (byte)iMap);
++		pClient->m_setTerrainSentBlocks.emplace(dwBlockIdx);
++	}
++}
++
++void CWorldMap::TickTerrainUpdates() // static
++{
++	ADDTOCALLSTACK("CWorldMap::TickTerrainUpdates");
++	// Terrain edits live on the server, but every client keeps its own copy of the map files, so a client
++	// only knows about a change once we send it the block. Walking into an area that was built while you
++	// were away has to look right, so each client is slowly fed the edited blocks around it - a few per
++	// tick, never the whole world at once.
++	static constexpr int iMaxPerClient = 4;
++
++	ClientIterator it;
++	for (CClient* pClient = it.next(); pClient != nullptr; pClient = it.next())
++	{
++		const CChar* pChar = pClient->GetChar();
++		if (pChar == nullptr)
++			continue;
++
++		const int iMap = pChar->GetTopMap();
++
++		if (pClient->m_fUltimaLive)
++		{
++			const auto* pBlocks = g_MapEdits.GetBlocks(iMap);
++
++			if ((pBlocks != nullptr) && !pBlocks->empty())
++			{
++				int iSent = 0;
++				for (const auto& entry : *pBlocks)
++				{
++					if (iSent >= iMaxPerClient)
++						break;
++					if (pClient->m_setTerrainSentBlocks.count(entry.first) != 0)
++						continue;
++					if (!TerrainBlockNearChar(pChar, iMap, entry.first, TERRAIN_SEND_RANGE_BLOCKS))
++						continue;
++
++					new PacketUpdateTerrain(pClient, entry.first, &(entry.second), (byte)iMap);
++					pClient->m_setTerrainSentBlocks.emplace(entry.first);
++					++iSent;
++				}
++			}
++		}
++
++		// Serpme katmanı harita dosyalarına dokunmadığı için canlı zemin kipi gerektirmez: herkes alır.
++		const auto* pOverlays = g_MapEdits.GetOverlayBlocks(iMap);
++		if ((pOverlays == nullptr) || pOverlays->empty())
++			continue;
++
++		int iOverlaysSent = 0;
++		for (const auto& entry : *pOverlays)
++		{
++			if (iOverlaysSent >= iMaxPerClient)
++				break;
++			if (pClient->m_setOverlaySentBlocks.count(entry.first) != 0)
++				continue;
++			if (!TerrainBlockNearChar(pChar, iMap, entry.first, TERRAIN_SEND_RANGE_BLOCKS))
++				continue;
++
++			new PacketUpdateTerrainOverlay(pClient, entry.first, &(entry.second), (byte)iMap);
++			pClient->m_setOverlaySentBlocks.emplace(entry.first);
++			++iOverlaysSent;
++		}
++	}
++}
++
++
++bool CWorldMap::SetTerrainTile(const CPointMap& pt, word wTerrainId, int8 z, bool fSendUpdate) // static
++{
++	ADDTOCALLSTACK("CWorldMap::SetTerrainTile");
++	// Change a single terrain tile: store it in the edit layer, drop the cached block and
++	// tell the clients about it.
++	if (!pt.IsValidPoint())
++		return false;
++
++	const int iMap = pt.m_map;
++	const int iBx = pt.m_x / UO_BLOCK_SIZE;
++	const int iBy = pt.m_y / UO_BLOCK_SIZE;
++	const dword dwBlockIdx = (dword)((iBx * (g_MapList.GetMapSizeY(iMap) / UO_BLOCK_SIZE)) + iBy);
++
++	const CServerMapBlock* pMapBlock = GetMapBlock(pt);	// mul (or dif, or a previous edit) data
++	if (pMapBlock == nullptr)
++		return false;
++
++	CUOMapBlock editedBlock = *(pMapBlock->GetTerrainBlock());
++
++	// Keep an untouched copy of the block the first time we touch it: that is what RESET restores.
++	// Only while the block still has no edits, otherwise we would store already edited data as "original".
++	if (g_MapEdits.GetBlock(iMap, dwBlockIdx) == nullptr)
++		g_MapEdits.SetOriginalBlock(iMap, dwBlockIdx, editedBlock);
++
++	CUOMapMeter& meter = editedBlock.m_Meter[(UO_BLOCK_OFFSET(pt.m_y) * UO_BLOCK_SIZE) + UO_BLOCK_OFFSET(pt.m_x)];
++	meter.m_wTerrainIndex = wTerrainId;
++	meter.m_z = z;
++
++	g_MapEdits.SetBlock(iMap, dwBlockIdx, editedBlock);
++	InvalidateMapBlock(iMap, iBx, iBy);
++	if (fSendUpdate)
++		SendTerrainBlockUpdate(iMap, dwBlockIdx, &editedBlock);
++	return true;
++}
++
++void CWorldMap::SendTerrainBlockUpdateAt(int iMap, dword dwBlockIdx) // static
++{
++	// Push one already edited block to the clients.
++	const CUOMapBlock* pBlock = g_MapEdits.GetBlock(iMap, dwBlockIdx);
++	if (pBlock != nullptr)
++		SendTerrainBlockUpdate(iMap, dwBlockIdx, pBlock);
++}
++
++
++
++// ----- Terrain editor undo history -----
++// Every brush stroke records the tiles it changed, so the editor can step back. Kept in memory only:
++// a restart starts with an empty history, the world itself stays as it was saved.
++struct TerrainEditTile
++{
++	int iMap;
++	short x, y;
++	word wId;
++	int8 z;
++	bool fOverlay;	// true: wId zemin değil, serpme katmanının eski değeri
++};
++
++static std::vector<std::vector<TerrainEditTile>> s_TerrainUndo;
++static int64 s_iTerrainNextSave = 0;	// the edits are written out at most this often
++#define TERRAIN_UNDO_MAX_STROKES	40
++
++
++// Deterministic 0..1 "random" value for a tile, so that a soft brush edge keeps the same dithering
++// pattern when the same spot is painted again instead of flickering.
++static float TerrainEditNoise(int x, int y) noexcept
++{
++	uint uiHash = (uint)((x * 73856093) ^ (y * 19349663));
++	uiHash ^= (uiHash >> 13);
++	uiHash *= 0x85EBCA6Bu;
++	uiHash ^= (uiHash >> 16);
++	return (float)(uiHash & 0xFFFFu) / 65535.0f;
++}
++
++int CWorldMap::EditStaticArea(const CPointMap& ptCenter, CChar* pChar, dword dwItemId, int iRadius, bool fSquare,
++	int iDensity, int iShape, bool fErase) // static
++{
++	ADDTOCALLSTACK("CWorldMap::EditStaticArea");
++	// The decoration brush: scatters items (trees, rocks, debris) over the brushed area, or removes the
++	// ones it placed. Everything it drops carries the tag "terrainedit", so the eraser can tell our own
++	// decoration apart from things players or scripts put there and never deletes those.
++	if (!ptCenter.IsValidPoint() || (pChar == nullptr))
++		return 0;
++
++	iRadius = maximum(0, minimum(TERRAIN_BRUSH_MAX_RADIUS, iRadius));
++	iDensity = maximum(1, minimum(100, iDensity));
++	iShape = ((iShape >= 0) && (iShape < TERRAIN_SHAPE_QTY)) ? iShape : TERRAIN_SHAPE_ROUND;
++
++	const int iMap = ptCenter.m_map;
++	const float fRadius = (float)iRadius + 0.5f;
++	const float fCore = fRadius;	// the decoration brush has no soft edge of its own, density does that
++	int iDone = 0;
++
++	for (int dy = -iRadius; dy <= iRadius; ++dy)
++	{
++		for (int dx = -iRadius; dx <= iRadius; ++dx)
++		{
++			const float fWeight = TerrainBrushWeight(iShape, (float)dx, (float)dy, fRadius, fCore, fSquare,
++				ptCenter.m_x + dx, ptCenter.m_y + dy);
++
++			if (fWeight <= 0.0f)
++				continue;
++
++			CPointMap pt((short)(ptCenter.m_x + dx), (short)(ptCenter.m_y + dy), 0, (uchar)iMap);
++			if (!pt.IsValidPoint())
++				continue;
++
++			if (fErase)
++			{
++				// Remove what the brush put here before.
++				auto pArea = CWorldSearchHolder::GetInstance(pt, 0);
++				for (;;)
++				{
++					CItem* pItem = pArea->GetItem();
++					if (pItem == nullptr)
++						break;
++					if (!pItem->m_TagDefs.GetKeyNum("terrainedit"))
++						continue;
++
++					pItem->Delete();
++					++iDone;
++				}
++
++				continue;
++			}
++
++			// Scatter: the density is the chance of a tile getting one, the brush shape thins the edge.
++			const float fChance = ((float)iDensity / 100.0f) * fWeight;
++			if (TerrainEditNoise(pt.m_x * 7, pt.m_y * 7) > fChance)
++				continue;
++
++			// Sit it on the ground.
++			uint64 uiBlockFlags = 0;
++			pt.m_z = GetHeightPoint2(pt, uiBlockFlags, true);
++
++			CItem* pItem = CItem::CreateScript((ITEMID_TYPE)dwItemId, pChar);
++			if (pItem == nullptr)
++				continue;
++
++			pItem->SetAttr(ATTR_MOVE_NEVER | ATTR_DECAY);
++			pItem->ClrAttr(ATTR_CAN_DECAY);
++			pItem->m_TagDefs.SetNum("terrainedit", 1);
++			pItem->MoveToUpdate(pt);
++			++iDone;
++		}
++	}
++
++	return iDone;
++}
++int CWorldMap::UndoTerrainStroke() // static
++{
++	ADDTOCALLSTACK("CWorldMap::UndoTerrainStroke");
++	// Puts back the tiles of the last stroke and pushes the blocks to the clients.
++	if (s_TerrainUndo.empty())
++		return 0;
++
++	const std::vector<TerrainEditTile> vecStroke = std::move(s_TerrainUndo.back());
++	s_TerrainUndo.pop_back();
++
++	std::set<dword> setDirtyBlocks;
++	std::set<dword> setDirtyOverlayBlocks;
++	int iRestored = 0;
++	const int iUndoMap = vecStroke.empty() ? 0 : vecStroke.front().iMap;
++
++	for (const TerrainEditTile& tile : vecStroke)
++	{
++		const CPointMap pt(tile.x, tile.y, 0, (uchar)(tile.iMap));
++		const int iBYMax = g_MapList.GetMapSizeY(tile.iMap) / UO_BLOCK_SIZE;
++		if (iBYMax <= 0)
++			continue;
++
++		const dword dwBlockIdx = (dword)(((pt.m_x / UO_BLOCK_SIZE) * iBYMax) + (pt.m_y / UO_BLOCK_SIZE));
++
++		if (tile.fOverlay)
++		{
++			// Serpme katmanı: zemine hiç dokunmadan eski serpintiyi geri koy.
++			if (!SetOverlayTile(pt, tile.wId))
++				continue;
++
++			++iRestored;
++			setDirtyOverlayBlocks.insert(dwBlockIdx);
++			continue;
++		}
++
++		if (!SetTerrainTile(pt, tile.wId, tile.z, false))
++			continue;
++
++		++iRestored;
++		setDirtyBlocks.insert(dwBlockIdx);
++	}
++
++	for (const dword dwBlockIdx : setDirtyBlocks)
++		SendTerrainBlockUpdateAt(iUndoMap, dwBlockIdx);
++
++	for (const dword dwBlockIdx : setDirtyOverlayBlocks)
++		SendOverlayBlockUpdate(iUndoMap, dwBlockIdx);
++
++	return iRestored;
++}
++
++
++int CWorldMap::GetTerrainUndoDepth() noexcept // static
++{
++	return (int)s_TerrainUndo.size();
++}
++
++bool CWorldMap::SaveTerrainEdits() // static
++{
++	ADDTOCALLSTACK("CWorldMap::SaveTerrainEdits");
++	CSString sTerrainName;
++	sTerrainName.Format("%s" SPHERE_FILE "terrain.bin", static_cast<lpctstr>(g_Cfg.m_sWorldBaseDir));
++	return g_MapEdits.Save(sTerrainName.GetBuffer());
++}
++
++// ----- serpme katmanı -----
++// Kum, çakıl, taş kırıntısı gibi şeyler zeminin yerine geçmez: ayrı bir katmanda durur ve istemci
++// onları zeminin üstüne çizer. Böylece döşediğin taşın üstüne kum serpince taş kaybolmaz.
++
++bool CWorldMap::SetOverlayTile(const CPointMap& pt, word wTileId) // static
++{
++	ADDTOCALLSTACK("CWorldMap::SetOverlayTile");
++	if (!pt.IsValidPoint())
++		return false;
++
++	const int iMap = pt.m_map;
++	const int iBYMax = g_MapList.GetMapSizeY(iMap) / UO_BLOCK_SIZE;
++	if (iBYMax <= 0)
++		return false;
++
++	const dword dwBlockIdx = (dword)(((pt.m_x / UO_BLOCK_SIZE) * iBYMax) + (pt.m_y / UO_BLOCK_SIZE));
++	const int iIdx = (UO_BLOCK_OFFSET(pt.m_y) * UO_BLOCK_SIZE) + UO_BLOCK_OFFSET(pt.m_x);
++
++	g_MapEdits.SetOverlay(iMap, dwBlockIdx, iIdx, wTileId);
++	return true;
++}
++
++void CWorldMap::SendOverlayBlockUpdate(int iMap, dword dwBlockIdx) // static
++{
++	ADDTOCALLSTACK("CWorldMap::SendOverlayBlockUpdate");
++	// Serpme katmanı harita dosyalarına dokunmuyor, o yüzden canlı zemin (UltimaLive) kipi gerekmez:
++	// yakındaki herkese gidebilir.
++	const CMapOverlayBlock* pBlock = g_MapEdits.GetOverlayBlock(iMap, dwBlockIdx);
++	if (pBlock == nullptr)
++		return;
++
++	ClientIterator it;
++	for (CClient* pClient = it.next(); pClient != nullptr; pClient = it.next())
++	{
++		const CChar* pChar = pClient->GetChar();
++		if (!TerrainBlockNearChar(pChar, iMap, dwBlockIdx, TERRAIN_SEND_RANGE_BLOCKS))
++			continue;
++
++		new PacketUpdateTerrainOverlay(pClient, dwBlockIdx, pBlock, (byte)iMap);
++		pClient->m_setOverlaySentBlocks.emplace(dwBlockIdx);
++	}
++}
++
++int CWorldMap::EditOverlayArea(const CPointMap& ptCenter, word wTileId, int iVariants, int iRadius, bool fSquare,
++	int iDensity, int iShape, word wSeed, bool fErase) // static
++{
++	ADDTOCALLSTACK("CWorldMap::EditOverlayArea");
++	// Serpme fırçası. Her kare serpintinin rastgele bir çeşitlemesini alır, yoğunluk da karelerin ne
++	// kadarının dolacağını söyler: aynı yerde fırçayı gezdirdikçe alan tek parça bir kütleye dönüşmez,
++	// gerçekten serpilmiş gibi dolar.
++	if (!ptCenter.IsValidPoint())
++		return 0;
++
++	iRadius = maximum(0, minimum(TERRAIN_BRUSH_MAX_RADIUS, iRadius));
++	iDensity = maximum(1, minimum(100, iDensity));
++	iVariants = maximum(1, minimum(64, iVariants));
++	iShape = ((iShape >= 0) && (iShape < TERRAIN_SHAPE_QTY)) ? iShape : TERRAIN_SHAPE_ROUND;
++
++	const int iMap = ptCenter.m_map;
++	const int iBYMax = g_MapList.GetMapSizeY(iMap) / UO_BLOCK_SIZE;
++	if (iBYMax <= 0)
++		return 0;
++
++	const float fRadius = (float)iRadius + 0.5f;
++	const float fCore = fRadius;	// kenarı yoğunluk kırıyor, ayrıca eritmeye gerek yok
++
++	std::set<dword> setDirtyBlocks;
++	std::vector<TerrainEditTile> vecUndo;
++	int iChanged = 0;
++
++	for (int dy = -iRadius; dy <= iRadius; ++dy)
++	{
++		for (int dx = -iRadius; dx <= iRadius; ++dx)
++		{
++			const float fWeight = TerrainBrushWeight(iShape, (float)dx, (float)dy, fRadius, fCore, fSquare,
++				ptCenter.m_x + dx, ptCenter.m_y + dy);
++
++			if (fWeight <= 0.0f)
++				continue;
++
++			const CPointMap pt((short)(ptCenter.m_x + dx), (short)(ptCenter.m_y + dy), 0, (uchar)iMap);
++			if (!pt.IsValidPoint())
++				continue;
++
++			const dword dwBlockIdx = (dword)(((pt.m_x / UO_BLOCK_SIZE) * iBYMax) + (pt.m_y / UO_BLOCK_SIZE));
++			const int iIdx = (UO_BLOCK_OFFSET(pt.m_y) * UO_BLOCK_SIZE) + UO_BLOCK_OFFSET(pt.m_x);
++			const word wOld = g_MapEdits.GetOverlay(iMap, dwBlockIdx, iIdx);
++			word wNew;
++
++			if (fErase)
++			{
++				wNew = 0;
++			}
++			else
++			{
++				// Hangi karelerin dolacağı her vuruşta değişsin: tohum fırça her bastığında başka.
++				const float fChance = ((float)iDensity / 100.0f) * minimum(1.0f, fWeight);
++				if (TerrainEditNoise((pt.m_x * 5) + (int)wSeed, (pt.m_y * 11) + (int)wSeed) > fChance)
++					continue;
++
++				// Aynı serpintiden zaten varsa dokunma: fırçayı basılı tutarken aynı kareler boşuna
++				// yeniden kurulmasın, alan yavaşça dolsun.
++				if ((wOld >= wTileId) && (wOld < (word)(wTileId + iVariants)))
++					continue;
++
++				const int iPick = (int)(TerrainEditNoise((pt.m_x * 17) + ((int)wSeed * 3), (pt.m_y * 23) + ((int)wSeed * 7)) * (float)iVariants);
++				wNew = (word)(wTileId + minimum(iVariants - 1, maximum(0, iPick)));
++			}
++
++			if (wNew == wOld)
++				continue;
++
++			if (!SetOverlayTile(pt, wNew))
++				continue;
++
++			vecUndo.emplace_back(TerrainEditTile{ iMap, pt.m_x, pt.m_y, wOld, (int8)0, true });
++			++iChanged;
++			setDirtyBlocks.insert(dwBlockIdx);
++		}
++	}
++
++	for (const dword dwBlockIdx : setDirtyBlocks)
++		SendOverlayBlockUpdate(iMap, dwBlockIdx);
++
++	if (!vecUndo.empty())
++	{
++		s_TerrainUndo.emplace_back(std::move(vecUndo));
++		while (s_TerrainUndo.size() > TERRAIN_UNDO_MAX_STROKES)
++			s_TerrainUndo.erase(s_TerrainUndo.begin());
++	}
++
++	if ((iChanged > 0) && g_MapEdits.IsDirty())
++	{
++		const int64 iNow = CWorldGameTime::GetCurrentTime().GetTimeRaw();
++
++		if (iNow >= s_iTerrainNextSave)
++		{
++			s_iTerrainNextSave = iNow + (30 * MSECS_PER_SEC);
++			SaveTerrainEdits();
++		}
++	}
++
++	return iChanged;
++}
++
++// ----- Texture sets -----
++// A texture set is one picture cut into N x N land tiles (see the terrain texture importer). The editor
++// tells us the set size when it paints, but the smoothing tool also has to know which tiles belong
++// together, so the list written next to the mul files is read once here.
++struct TerrainTileSet
++{
++	word wBase;
++	int iSize;
++};
++
++static std::unordered_map<word, TerrainTileSet> s_TerrainSets;	// every piece points at its set
++static bool s_fTerrainSetsLoaded = false;
++
++static void LoadTerrainSets()
++{
++	if (s_fTerrainSetsLoaded)
++		return;
++
++	s_fTerrainSetsLoaded = true;
++
++	const CSString sPath = g_Install.GetPreferPath("myshard_terrain_sets.txt");
++	CSFileText file;
++	if (!file.Open(sPath.GetBuffer(), OF_READ | OF_TEXT | OF_NONCRIT))
++		return;
++
++	tchar szLine[256];
++	int iSets = 0;
++
++	while (file.ReadString(szLine, sizeof(szLine) - 1) != nullptr)
++	{
++		// "0x1000 16 black irregular cobblestone"
++		uint uiBase = 0;
++		int iSize = 0;
++		if (sscanf(szLine, "%x %d", &uiBase, &iSize) != 2)
++			continue;
++		if ((iSize < 1) || (iSize > 16) || (uiBase == 0) || (uiBase > 0x3FFF))
++			continue;
++
++		const TerrainTileSet set{ (word)uiBase, iSize };
++		for (int i = 0; i < (iSize * iSize); ++i)
++		{
++			const uint uiPiece = uiBase + (uint)i;
++			if (uiPiece <= 0x3FFF)
++				s_TerrainSets[(word)uiPiece] = set;
++		}
++		++iSets;
++	}
++
++	file.Close();
++
++	if (iSets > 0)
++		g_Log.Event(LOGM_INIT, "Loaded %d terrain texture set(s) from '%s'.\n", iSets, sPath.GetBuffer());
++}
++
++// The ground a tile belongs to: the set it is a piece of, or the tile itself.
++static word TerrainGroundOf(word wGraphic)
++{
++	LoadTerrainSets();
++
++	const auto it = s_TerrainSets.find(wGraphic);
++	return (it == s_TerrainSets.end()) ? wGraphic : it->second.wBase;
++}
++
++// The tile of wGraphic.s ground that belongs at these coordinates. For a plain tile that is the tile
++// itself; for a piece of a texture set it is the piece whose place this is, so smoothing never breaks
++// the picture apart.
++static word TerrainPieceAt(word wGraphic, int iX, int iY)
++{
++	LoadTerrainSets();
++
++	const auto it = s_TerrainSets.find(wGraphic);
++	if (it == s_TerrainSets.end())
++		return wGraphic;
++
++	const int iSize = it->second.iSize;
++	const int iPx = ((iX % iSize) + iSize) % iSize;
++	const int iPy = ((iY % iSize) + iSize) % iSize;
++
++	return (word)(it->second.wBase + (iPx * iSize) + iPy);
++}
++
++
++// Brush shapes. The client draws its icons from the same formulas, so what you see in the grid is what
++// the brush does. dx/dy are tile offsets from the brush centre.
++float CWorldMap::TerrainBrushWeight(int iShape, float fdx, float fdy, float fRadius, float fCore, bool fSquare, int iWorldX, int iWorldY) noexcept // static
++{
++	if (fRadius <= 0.0f)
++		return ((fdx == 0.0f) && (fdy == 0.0f)) ? 1.0f : 0.0f;
++
++	// The plain distance of this tile from the centre, in the metric of the shape.
++	float fDist;
++
++	switch (iShape)
++	{
++		default:
++		case TERRAIN_SHAPE_ROUND:
++		case TERRAIN_SHAPE_HARD:
++		case TERRAIN_SHAPE_SPECKLE:
++		case TERRAIN_SHAPE_ORGANIC:
++			fDist = fSquare ? maximum(fabsf(fdx), fabsf(fdy)) : sqrtf((fdx * fdx) + (fdy * fdy));
++			break;
++
++		case TERRAIN_SHAPE_SQUARE:
++			fDist = maximum(fabsf(fdx), fabsf(fdy));
++			break;
++
++		case TERRAIN_SHAPE_LINE_NS:		// a narrow line along the north-south axis
++			fDist = sqrtf((fdx * fdx * 16.0f) + (fdy * fdy));
++			break;
++
++		case TERRAIN_SHAPE_LINE_WE:
++			fDist = sqrtf((fdx * fdx) + (fdy * fdy * 16.0f));
++			break;
++
++		case TERRAIN_SHAPE_LINE_NE:		// narrow along one diagonal
++		{
++			const float fu = (fdx + fdy) * 0.70710678f;
++			const float fv = (fdx - fdy) * 0.70710678f;
++			fDist = sqrtf((fv * fv * 16.0f) + (fu * fu));
++			break;
++		}
++
++		case TERRAIN_SHAPE_LINE_NW:
++		{
++			const float fu = (fdx - fdy) * 0.70710678f;
++			const float fv = (fdx + fdy) * 0.70710678f;
++			fDist = sqrtf((fv * fv * 16.0f) + (fu * fu));
++			break;
++		}
++
++		case TERRAIN_SHAPE_RING:
++		{
++			// Hollow: strongest at 70% of the radius, nothing in the middle.
++			const float fBase = sqrtf((fdx * fdx) + (fdy * fdy));
++			const float fBand = maximum(1.0f, fRadius * 0.3f);
++			const float fOff = fabsf(fBase - (fRadius * 0.7f));
++			return (fOff >= fBand) ? 0.0f : (1.0f - (fOff / fBand));
++		}
++
++		case TERRAIN_SHAPE_STAR4:
++		{
++			// Four arms: the diagonals are pushed away, the axes stay.
++			const float fBase = sqrtf((fdx * fdx) + (fdy * fdy));
++			const float fSmall = minimum(fabsf(fdx), fabsf(fdy));
++			fDist = fBase + (fSmall * 2.0f);
++			break;
++		}
++
++		case TERRAIN_SHAPE_STAR8:
++		{
++			const float fBase = sqrtf((fdx * fdx) + (fdy * fdy));
++			const float fSmallAxis = minimum(fabsf(fdx), fabsf(fdy));
++			const float fu = fabsf((fdx + fdy) * 0.70710678f);
++			const float fv = fabsf((fdx - fdy) * 0.70710678f);
++			const float fSmallDiag = minimum(fu, fv);
++			fDist = fBase + (minimum(fSmallAxis, fSmallDiag) * 2.5f);
++			break;
++		}
++
++		case TERRAIN_SHAPE_DOT:
++			fDist = sqrtf((fdx * fdx) + (fdy * fdy)) * 2.5f;	// a small core inside the same radius
++			break;
++	}
++
++	if (fDist > fRadius)
++		return 0.0f;
++
++	float fWeight;
++
++	if (iShape == TERRAIN_SHAPE_HARD || iShape == TERRAIN_SHAPE_SQUARE)
++		fWeight = 1.0f;	// no fade at all, a stamp with a clean edge
++	else
++		fWeight = (fDist <= fCore) ? 1.0f : ((fRadius > fCore) ? ((fRadius - fDist) / (fRadius - fCore)) : 0.0f);
++
++	if (iShape == TERRAIN_SHAPE_SPECKLE)
++	{
++		// Scattered dots: most tiles are skipped, the rest apply fully.
++		fWeight *= (TerrainEditNoise(iWorldX * 3, iWorldY * 3) > 0.55f) ? 1.0f : 0.0f;
++	}
++	else if (iShape == TERRAIN_SHAPE_ORGANIC)
++	{
++		// Uneven, blotchy edge: good for natural ground.
++		fWeight *= 0.35f + (0.65f * TerrainEditNoise(iWorldX, iWorldY));
++	}
++
++	return fWeight;
++}
++int CWorldMap::EditTerrainArea(const CPointMap& ptCenter, int iTool, word wTerrainId, int iZValue, int iRadius, bool fSquare, int iSoftness, int iSetSize, int iShape, word wVariantMid, int iVariantMidSet, word wVariantLow, int iVariantLowSet) // static
++{
++	ADDTOCALLSTACK("CWorldMap::EditTerrainArea");
++	// One brush stroke of the terrain editor. Every touched block is pushed to the clients once,
++	// at the end, instead of once per tile.
++	// iSoftness (0..100) is the share of the brush radius that fades out: the height tools apply a
++	// smaller and smaller part of their change towards the edge, and paint scatters its tiles there,
++	// so a stroke blends into the terrain around it instead of stamping a hard circle.
++	if (!ptCenter.IsValidPoint())
++		return 0;
++
++	iRadius = maximum(0, minimum(TERRAIN_BRUSH_MAX_RADIUS, iRadius));
++	iSoftness = maximum(0, minimum(100, iSoftness));
++	iSetSize = maximum(1, minimum(16, iSetSize));
++	iShape = ((iShape >= 0) && (iShape < TERRAIN_SHAPE_QTY)) ? iShape : TERRAIN_SHAPE_ROUND;
++	// Zayıf karışım varyantları artık kullanılmıyor (boyama sade haline döndü), ama paket uyumu için duruyor.
++	UnreferencedParameter(wVariantMid);
++	UnreferencedParameter(wVariantLow);
++	UnreferencedParameter(iVariantMidSet);
++	UnreferencedParameter(iVariantLowSet);
++	const int iMap = ptCenter.m_map;
++	const int iSide = (iRadius * 2) + 1;
++
++	// Snapshot the heights first (with a one tile border), so that smoothing reads the terrain as it
++	// was before this stroke and doesn't feed on its own output.
++	const int iSnapSide = iSide + 2;
++	std::vector<int8> vecHeights((size_t)(iSnapSide * iSnapSide), (int8)0);
++	std::vector<word> vecIds((size_t)(iSnapSide * iSnapSide), (word)0);
++	std::vector<bool> vecValid((size_t)(iSnapSide * iSnapSide), false);
++	for (int iy = 0; iy < iSnapSide; ++iy)
++	{
++		for (int ix = 0; ix < iSnapSide; ++ix)
++		{
++			const CPointMap pt((short)(ptCenter.m_x - iRadius - 1 + ix), (short)(ptCenter.m_y - iRadius - 1 + iy), 0, (uchar)iMap);
++			if (!pt.IsValidPoint())
++				continue;
++			const CUOMapMeter* pMeter = GetMapMeter(pt);
++			if (pMeter == nullptr)
++				continue;
++			vecHeights[(size_t)((iy * iSnapSide) + ix)] = pMeter->m_z;
++			vecIds[(size_t)((iy * iSnapSide) + ix)] = pMeter->m_wTerrainIndex;
++			vecValid[(size_t)((iy * iSnapSide) + ix)] = true;
++		}
++	}
++
++	std::set<dword> setDirtyBlocks;
++	std::vector<TerrainEditTile> vecUndo;	// what this stroke replaced, for UNDO
++	int iChanged = 0;
++	int iRevertFailed = 0;					// tiles RESET could not restore (no original data)
++	const float fRadius = (float)iRadius + 0.5f;
++
++	// The soft edge is a band at the rim, not a share of the whole brush: a wide brush should still lay
++	// a solid floor and only fade over the last few tiles. Without this a 33x33 brush at 70% turned into
++	// a twelve tile wide field of scattered single tiles instead of a paved area with a soft border.
++	const float fFadeBand = ((float)iSoftness / 100.0f) * minimum(fRadius * 0.5f, 6.0f);
++	const float fCore = maximum(0.0f, fRadius - fFadeBand);	// full strength up to here
++
++	for (int dy = -iRadius; dy <= iRadius; ++dy)
++	{
++		for (int dx = -iRadius; dx <= iRadius; ++dx)
++		{
++			// How much of the brush applies here: 1 in the core, fading to 0 at the edge, in the shape
++			// the user picked.
++			float fWeight = TerrainBrushWeight(iShape, (float)dx, (float)dy, fRadius, fCore, fSquare,
++				ptCenter.m_x + dx, ptCenter.m_y + dy);
++
++			if (fWeight <= 0.0f)
++				continue;
++			fWeight = minimum(1.0f, fWeight);
++
++			const CPointMap pt((short)(ptCenter.m_x + dx), (short)(ptCenter.m_y + dy), 0, (uchar)iMap);
++			if (!pt.IsValidPoint())
++				continue;
++
++			const CUOMapMeter* pMeter = GetMapMeter(pt);
++			if (pMeter == nullptr)
++				continue;
++
++			word wNewId = pMeter->m_wTerrainIndex;
++			int iNewZ = pMeter->m_z;
++
++			switch (iTool)
++			{
++				case TERRAIN_TOOL_PAINT:
++				case TERRAIN_TOOL_PAINTZ:
++				{
++					// A tile is either the new ground or not. The soft edge thins the tiles out towards the
++					// rim, so the border breaks up instead of ending in a clean circle.
++					if ((fWeight < 1.0f) && (TerrainEditNoise(pt.m_x, pt.m_y) > fWeight))
++						continue;
++
++					// A texture set is one picture cut into N x N tiles: pick the piece that belongs at
++					// these world coordinates, so the pieces line up into the whole picture.
++					if (iSetSize > 1)
++						wNewId = (word)(wTerrainId + (((pt.m_x % iSetSize) * iSetSize) + (pt.m_y % iSetSize)));
++					else
++						wNewId = wTerrainId;
++
++					if (iTool == TERRAIN_TOOL_PAINTZ)
++						iNewZ = pMeter->m_z + (int)lroundf((float)(iZValue - pMeter->m_z) * fWeight);
++
++					break;
++				}
++
++				case TERRAIN_TOOL_SETZ:
++					iNewZ = pMeter->m_z + (int)lroundf((float)(iZValue - pMeter->m_z) * fWeight);
++					break;
++
++				case TERRAIN_TOOL_RAISE:
++					iNewZ = pMeter->m_z + (int)lroundf((float)iZValue * fWeight);
++					break;
++
++				case TERRAIN_TOOL_SMOOTH:
++				{
++					// Weighted average of the 3x3 neighbourhood, taken from the snapshot so the stroke
++					// does not feed on its own output. iZValue carries the strength in percent.
++					const int ix = dx + iRadius + 1;
++					const int iy = dy + iRadius + 1;
++					float fSum = 0.0f, fQty = 0.0f;
++					for (int ny = -1; ny <= 1; ++ny)
++					{
++						for (int nx = -1; nx <= 1; ++nx)
++						{
++							const size_t uiIdx = (size_t)(((iy + ny) * iSnapSide) + (ix + nx));
++							if (!vecValid[uiIdx])
++								continue;
++							const float fKernel = ((nx == 0) && (ny == 0)) ? 1.0f : (((nx == 0) || (ny == 0)) ? 2.0f : 1.0f);
++							fSum += (float)vecHeights[uiIdx] * fKernel;
++							fQty += fKernel;
++						}
++					}
++					if (fQty <= 0.0f)
++						continue;
++
++					const float fAverage = fSum / fQty;
++					const float fStrength = (iZValue > 0) ? (minimum(100, iZValue) / 100.0f) : 1.0f;
++					const float fDelta = (fAverage - (float)pMeter->m_z) * fWeight * fStrength;
++
++					// Rounding would eat every change below half a step and the tool would look dead on
++					// gentle slopes, so always move at least one step towards the average.
++					int iStep = (int)lroundf(fDelta);
++					if ((iStep == 0) && (fabsf(fAverage - (float)pMeter->m_z) >= 0.5f) && (fWeight >= 0.5f))
++						iStep = (fDelta > 0.0f) ? 1 : ((fDelta < 0.0f) ? -1 : 0);
++
++					iNewZ = pMeter->m_z + iStep;
++
++					// Also round off the painted shape itself: a tile that is surrounded by another
++					// graphic takes that graphic. This eats the jagged staircase edges and the single
++					// stray tiles a brush leaves behind, which is what smoothing means on flat ground.
++					// The strength decides how convincing the neighbourhood has to be.
++					const int iNeeded = maximum(4, minimum(8, 5 + (int)lroundf((100.0f - (fStrength * 100.0f)) / 33.0f)));
++					word wBest = 0;
++					int iBestQty = 0;
++					for (int ny = -1; ny <= 1; ++ny)
++					{
++						for (int nx = -1; nx <= 1; ++nx)
++						{
++							if ((nx == 0) && (ny == 0))
++								continue;
++							const size_t uiIdx = (size_t)(((iy + ny) * iSnapSide) + (ix + nx));
++							if (!vecValid[uiIdx])
++								continue;
++
++							// Count by ground, not by tile: the pieces of one texture set are different
++							// tiles but the same ground, and so are the variants of UO's own grounds.
++							const word wCandidate = vecIds[uiIdx];
++							const word wCandidateGround = TerrainGroundOf(wCandidate);
++							int iCandidateQty = 0;
++							for (int my = -1; my <= 1; ++my)
++							{
++								for (int mx = -1; mx <= 1; ++mx)
++								{
++									if ((mx == 0) && (my == 0))
++										continue;
++									const size_t uiOther = (size_t)(((iy + my) * iSnapSide) + (ix + mx));
++									if (vecValid[uiOther] && (TerrainGroundOf(vecIds[uiOther]) == wCandidateGround))
++										++iCandidateQty;
++								}
++							}
++
++							if (iCandidateQty > iBestQty)
++							{
++								iBestQty = iCandidateQty;
++								wBest = wCandidate;
++							}
++						}
++					}
++
++					// Take over the neighbourhood's ground, but as the piece that belongs at these
++					// coordinates: copying the neighbour's own piece would scramble a texture set.
++					if ((iBestQty >= iNeeded) && (fWeight >= 0.35f))
++					{
++						const word wPiece = TerrainPieceAt(wBest, pt.m_x, pt.m_y);
++
++						if (wPiece != pMeter->m_wTerrainIndex)
++							wNewId = wPiece;
++					}
++
++					break;
++				}
++
++				case TERRAIN_TOOL_REVERT:
++				{
++					// Put the untouched map data back. The mul file is the real original, so it is read
++					// first; the copy taken at the first edit is only a fallback for when that read fails.
++					const int iBx = pt.m_x / UO_BLOCK_SIZE;
++					const int iBy = pt.m_y / UO_BLOCK_SIZE;
++					const dword dwOrigIdx = (dword)((iBx * (g_MapList.GetMapSizeY(iMap) / UO_BLOCK_SIZE)) + iBy);
++
++					CUOMapBlock blockFromMul{};
++					const CUOMapBlock* pOriginal = nullptr;
++
++					if (ReadTerrainBlockFromMul(iMap, dwOrigIdx, blockFromMul))
++						pOriginal = &blockFromMul;
++					else
++						pOriginal = g_MapEdits.GetOriginalBlock(iMap, dwOrigIdx);
++
++					if (pOriginal == nullptr)
++					{
++						++iRevertFailed;
++						continue;
++					}
++
++					const CUOMapMeter& meterOrig = pOriginal->m_Meter[(UO_BLOCK_OFFSET(pt.m_y) * UO_BLOCK_SIZE) + UO_BLOCK_OFFSET(pt.m_x)];
++					wNewId = meterOrig.m_wTerrainIndex;
++					iNewZ = meterOrig.m_z;
++					break;
++				}
++
++				default:
++					return 0;
++			}
++
++			iNewZ = maximum(-128, minimum(127, iNewZ));
++			if ((wNewId == pMeter->m_wTerrainIndex) && (iNewZ == pMeter->m_z))
++				continue;
++
++			const TerrainEditTile tileOld{ iMap, pt.m_x, pt.m_y, pMeter->m_wTerrainIndex, pMeter->m_z, false };
++
++			if (!SetTerrainTile(pt, wNewId, (int8)iNewZ, false))
++				continue;
++
++			vecUndo.emplace_back(tileOld);
++			++iChanged;
++			const int iBx = pt.m_x / UO_BLOCK_SIZE;
++			const int iBy = pt.m_y / UO_BLOCK_SIZE;
++			setDirtyBlocks.insert((dword)((iBx * (g_MapList.GetMapSizeY(iMap) / UO_BLOCK_SIZE)) + iBy));
++		}
++	}
++
++	for (const dword dwBlockIdx : setDirtyBlocks)
++		SendTerrainBlockUpdateAt(iMap, dwBlockIdx);
++
++	if (!vecUndo.empty())
++	{
++		s_TerrainUndo.emplace_back(std::move(vecUndo));
++		while (s_TerrainUndo.size() > TERRAIN_UNDO_MAX_STROKES)
++			s_TerrainUndo.erase(s_TerrainUndo.begin());
++	}
++
++	// Write the edits out every now and then. The world save would do it too, but a terrain session is
++	// usually a long series of strokes and nobody wants to lose an afternoon of building to a crash.
++	if ((iChanged > 0) && g_MapEdits.IsDirty())
++	{
++		const int64 iNow = CWorldGameTime::GetCurrentTime().GetTimeRaw();
++
++		if (iNow >= s_iTerrainNextSave)
++		{
++			s_iTerrainNextSave = iNow + (30 * MSECS_PER_SEC);
++			SaveTerrainEdits();
++		}
++	}
++
++	if (iRevertFailed > 0)
++		g_Log.EventWarn("Terrain RESET: %d tile(s) had no original map data.\n", iRevertFailed);
++
++
++	return iChanged;
++}
++
+ // Tile info fromMAP*.MUL at given coordinates
+ const CUOMapMeter* CWorldMap::GetMapMeter(const CPointMap& pt) // static
+ {
+diff --git a/src/game/CWorldMap.h b/src/game/CWorldMap.h
+index c58ac7b0..8d5ed4df 100644
+--- a/src/game/CWorldMap.h
++++ b/src/game/CWorldMap.h
+@@ -13,8 +13,46 @@
+ #include <optional>
+ 
+ class CObjBase;
++class CClient;
+ 
+ 
++
++// Terrain editor tools. The client sends these values in the 0x12 sub-command 0xCD packet,
++// so both sides have to agree on them.
++enum TERRAIN_TOOL_TYPE
++{
++	TERRAIN_TOOL_PAINT	= 0,	// change the tile graphic
++	TERRAIN_TOOL_SETZ	= 1,	// set an absolute height
++	TERRAIN_TOOL_RAISE	= 2,	// raise / lower the height by a delta
++	TERRAIN_TOOL_SMOOTH	= 3,	// average the height with the neighbours
++	TERRAIN_TOOL_PAINTZ	= 4,	// graphic and height at once
++	TERRAIN_TOOL_REVERT	= 5,	// put the original mul data back (RESET)
++	TERRAIN_TOOL_OVERLAY	= 6,	// serpme katmanı: zeminin ÜSTÜNE kum/çakıl/taş serper
++	TERRAIN_TOOL_OVERLAY_DEL= 7		// serpme katmanını siler (zemine dokunmaz)
++
++};
++
++#define TERRAIN_BRUSH_MAX_RADIUS	16
++
++// Terrain editor brush shapes. The client sends the index; it draws its icons from the same maths.
++enum TERRAIN_SHAPE_TYPE
++{
++	TERRAIN_SHAPE_ROUND		= 0,	// soft round, the default
++	TERRAIN_SHAPE_HARD		= 1,	// round with a clean edge
++	TERRAIN_SHAPE_SQUARE	= 2,	// square with a clean edge
++	TERRAIN_SHAPE_LINE_NS	= 3,	// narrow line, north-south
++	TERRAIN_SHAPE_LINE_WE	= 4,	// narrow line, west-east
++	TERRAIN_SHAPE_LINE_NE	= 5,	// narrow line, diagonal
++	TERRAIN_SHAPE_LINE_NW	= 6,	// narrow line, the other diagonal
++	TERRAIN_SHAPE_RING		= 7,	// hollow ring
++	TERRAIN_SHAPE_STAR4		= 8,	// four arms
++	TERRAIN_SHAPE_STAR8		= 9,	// eight arms
++	TERRAIN_SHAPE_DOT		= 10,	// small core
++	TERRAIN_SHAPE_SPECKLE	= 11,	// scattered dots
++	TERRAIN_SHAPE_ORGANIC	= 12,	// blotchy, uneven edge
++	TERRAIN_SHAPE_QTY		= 13
++};
++
+ class CWorldMap
+ {
+ public:
+@@ -36,6 +74,25 @@ public:
+ 	static const CServerMapBlock* GetMapBlock(const CPointMap& pt);
+ 	static const CUOMapMeter* GetMapMeter(const CPointMap& pt); // Height of MAP0.MUL at given coordinates
+ 
++	// Terrain editing (in-game terrain editor)
++
++	static void InvalidateMapBlock(int iMap, int iBx, int iBy) noexcept;
++	static void SendTerrainBlockUpdate(int iMap, dword dwBlockIdx, const CUOMapBlock* pBlock);
++	static void SendTerrainBlockUpdateAt(int iMap, dword dwBlockIdx);
++	static void TickTerrainUpdates();
++	static int  EditStaticArea(const CPointMap& ptCenter, CChar* pChar, dword dwItemId, int iRadius, bool fSquare,
++		int iDensity, int iShape, bool fErase);
++	static bool SetTerrainTile(const CPointMap& pt, word wTerrainId, int8 z, bool fSendUpdate = true);
++	static int  EditTerrainArea(const CPointMap& ptCenter, int iTool, word wTerrainId, int iZValue, int iRadius, bool fSquare, int iSoftness, int iSetSize = 1, int iShape = 0,
++		word wVariantMid = 0, int iVariantMidSet = 1, word wVariantLow = 0, int iVariantLowSet = 1);
++	static float TerrainBrushWeight(int iShape, float fdx, float fdy, float fRadius, float fCore, bool fSquare, int iWorldX, int iWorldY) noexcept;
++	static int  EditOverlayArea(const CPointMap& ptCenter, word wTileId, int iVariants, int iRadius, bool fSquare,
++		int iDensity, int iShape, word wSeed, bool fErase);
++	static bool SetOverlayTile(const CPointMap& pt, word wTileId);
++	static void SendOverlayBlockUpdate(int iMap, dword dwBlockIdx);
++	static int  UndoTerrainStroke();
++	static int  GetTerrainUndoDepth() noexcept;
++	static bool SaveTerrainEdits();
+ 	static std::optional<CUOMapMeter> GetMapMeterAdjusted(const CPointMap& pt);
+     static CUOMapMeter CheckMapTerrain(const CUOMapMeter& meterDefault, short x, short y, uchar map);
+     static int GetFloorAverageHeight(int iPoint1, int iPoint2, int iAverage);
+diff --git a/src/game/clients/CClient.cpp b/src/game/clients/CClient.cpp
+index 6c380628..190375fc 100644
+--- a/src/game/clients/CClient.cpp
++++ b/src/game/clients/CClient.cpp
+@@ -82,6 +82,7 @@ CClient::CClient(CNetState* state)
+ 	m_SkillThrowingAnimHue = 0;
+ 	m_SkillThrowingAnimRender = 0;
+ 	m_fUseNewChatSystem = false;
++	m_fUltimaLive = false;
+ }
+ 
+ 
+@@ -1759,6 +1760,61 @@ bool CClient::r_Verb( CScript & s, CTextConsole * pSrc ) // Execute command from
+ 		case CV_TELE:
+ 			Cmd_Skill_Magery(SPELL_Teleport, dynamic_cast<CObjBase *>(pSrc));
+ 			break;
++		case CV_TERRAIN:
++		{
++			// Terrain editor: TERRAIN <tileid> [z] [radius]. Without arguments it reports the tile we stand on.
++			if ( GetPrivLevel() < PLEVEL_GM )
++			{
++				SysMessage( "You are not allowed to edit the terrain." );
++				break;
++			}
++			if ( m_pChar == nullptr )
++				break;
++
++			if ( !m_fUltimaLive )
++			{
++				// The client needs to be in UltimaLive mode to see terrain changes without relogging.
++				addUltimaLive();
++			}
++
++			const CPointMap ptMe = m_pChar->GetTopPoint();
++			if ( ! s.HasArgs() )
++			{
++				const CUOMapMeter * pMeter = CWorldMap::GetMapMeter( ptMe );
++				if ( pMeter != nullptr )
++					SysMessagef( "Terrain at %d,%d (map %d): id=0%x z=%d", ptMe.m_x, ptMe.m_y, ptMe.m_map, pMeter->m_wTerrainIndex, pMeter->m_z );
++				else
++					SysMessage( "Usage: TERRAIN <tileid> [z] [radius]" );
++				break;
++			}
++
++			int64 piCmd[3];
++			const int iQty = Str_ParseCmds( s.GetArgRaw(), piCmd, ARRAY_COUNT(piCmd) );
++			if ( iQty < 1 )
++			{
++				SysMessage( "Usage: TERRAIN <tileid> [z] [radius]" );
++				break;
++			}
++
++			const word wTerrainId = (word)(piCmd[0]);
++			const int8 iZ = (int8)((iQty > 1) ? piCmd[1] : ptMe.m_z);
++			const int iRadius = maximum( 0, minimum( 32, (iQty > 2) ? (int)(piCmd[2]) : 0 ) );
++
++			int iChanged = 0;
++			for ( int dx = -iRadius; dx <= iRadius; ++dx )
++			{
++				for ( int dy = -iRadius; dy <= iRadius; ++dy )
++				{
++					CPointMap ptEdit = ptMe;
++					ptEdit.m_x = (short)(ptMe.m_x + dx);
++					ptEdit.m_y = (short)(ptMe.m_y + dy);
++					if ( CWorldMap::SetTerrainTile( ptEdit, wTerrainId, iZ ) )
++						++iChanged;
++				}
++			}
++			SysMessagef( "Changed %d terrain tile(s) to id=0%x z=%d.", iChanged, wTerrainId, iZ );
++			break;
++		}
+ 		case CV_TILE:
+ 			if ( ! s.HasArgs() )
+ 			{
+diff --git a/src/game/clients/CClient.h b/src/game/clients/CClient.h
+index 69ad4b58..ca0eb001 100644
+--- a/src/game/clients/CClient.h
++++ b/src/game/clients/CClient.h
+@@ -16,6 +16,7 @@
+ #include "CChatChanMember.h"
+ #include "CGlobalChatChanMember.h"
+ #include "CGMPage.h"
++#include <set>
+ 
+ class Packet;
+ class PacketCloseUIWindow;
+@@ -146,6 +147,9 @@ public:
+ 	CAccount * m_pAccount;			// The account name. we logged in on
+ 
+ 	bool m_fUseNewChatSystem;		// is this client compatible with new SA+ chat system?
++	bool m_fUltimaLive;				// did we send the UltimaLive handshake to this client? (live terrain updates)
++	std::set<dword> m_setTerrainSentBlocks;	// edited terrain blocks this client already has
++	std::set<dword> m_setOverlaySentBlocks;	// serpme katmanı blokları: istemcide zaten olanlar
+ 	int64 m_timeLogin;			    // World clock of login time. "LASTCONNECTTIME"
+ 	int64 m_timeLastEvent;		    // Last time we got event from client.
+ 	int64 m_timeLastEventWalk;	    // Last time we got a walk event from client
+@@ -560,6 +564,7 @@ public:
+ 	bool addGumpDialogProps( const CUID& uid );
+ 
+ 	void addLoginComplete();
++	void addUltimaLive();	// switch the client to UltimaLive mode (live terrain updates)
+ 	void addChatSystemMessage(CHATMSG_TYPE iType, lpctstr pszName1 = nullptr, lpctstr pszName2 = nullptr, CLanguageID lang = 0 );
+ 
+ 	void addGlobalChatConnect();
+diff --git a/src/game/clients/CClientMsg.cpp b/src/game/clients/CClientMsg.cpp
+index ee011c4e..46dcaff7 100644
+--- a/src/game/clients/CClientMsg.cpp
++++ b/src/game/clients/CClientMsg.cpp
+@@ -2776,6 +2776,27 @@ void CClient::addLoginComplete()
+ 	new PacketLoginComplete(this);
+ }
+ 
++void CClient::addUltimaLive()
++{
++	ADDTOCALLSTACK("CClient::addUltimaLive");
++	// Switch this client to UltimaLive mode: it starts using its own copies of the map files and
++	// accepts live terrain updates. This is NOT done at login on purpose: the first handshake makes
++	// the client copy the map files (hundreds of MB), so we only do it when the terrain editor is used.
++	if ( m_fUltimaLive )
++		return;
++
++	new PacketQueryClient(this, 0x02);	// live login confirmation (shard name = client side folder)
++	new PacketQueryClient(this, 0x01);	// map definitions
++	m_fUltimaLive = true;
++
++	// The client keeps its own copy of the map files between sessions and has no idea what changed while
++	// it was away. The edited blocks around it are fed in from the world tick, a few at a time, so it
++	// catches up without a burst of hundreds of packets.
++	m_setTerrainSentBlocks.clear();
++
++	SysMessage("Live terrain mode enabled: the client is catching up with the edited terrain.");
++}
++
+ void CClient::addChatSystemMessage( CHATMSG_TYPE iType, lpctstr pszName1, lpctstr pszName2, CLanguageID lang )
+ {
+ 	ADDTOCALLSTACK("CClient::addChatSystemMessage");
+diff --git a/src/network/receive.cpp b/src/network/receive.cpp
+index ca2fa1e2..58e31f25 100644
+--- a/src/network/receive.cpp
++++ b/src/network/receive.cpp
+@@ -547,6 +547,148 @@ bool PacketTextCommand::onReceive(CNetState* net)
+ 		return true;
+ 	}
+ 
++	// MyShard: sub-command 0xCD = one terrain editor brush stroke.
++	//  byte tool, word x, word y, word tile id, byte radius, byte flags (bit 0 = square brush), sbyte z,
++	//  byte edge softness in percent (all little-endian).
++	if ((byte)type == 0xCD)
++	{
++		CChar* pChar = client->GetChar();
++		if ((pChar == nullptr) || (packetLength < 15))
++			return true;
++
++		if (client->GetPrivLevel() < PLEVEL_GM)
++		{
++			client->SysMessage("You are not allowed to edit the terrain.");
++			return true;
++		}
++
++		// Live terrain updates have to be on, otherwise the editor would paint into the void.
++		client->addUltimaLive();
++
++		const byte bTool = readByte();
++		const uint uiX = readByte() | ((uint)readByte() << 8);
++		const uint uiY = readByte() | ((uint)readByte() << 8);
++		const uint uiTileId = readByte() | ((uint)readByte() << 8);
++		const int iRadius = (int)readByte();
++		const byte bFlags = readByte();
++		const int iZValue = (int)(int8)readByte();
++		const int iSoftness = (int)readByte();
++		const int iSetSize = (packetLength >= 16) ? (int)readByte() : 1;	// texture set: NxN tiles per picture
++		const int iShape = (packetLength >= 17) ? (int)readByte() : 0;	// brush shape
++
++		// The weaker mixes of the same texture, used to fade the edge of a stroke (0 = none).
++		word wVariantMid = 0, wVariantLow = 0;
++		int iVariantMidSet = 1, iVariantLowSet = 1;
++
++		if (packetLength >= 23)
++		{
++			wVariantMid = (word)(readByte() | ((uint)readByte() << 8));
++			iVariantMidSet = (int)readByte();
++			wVariantLow = (word)(readByte() | ((uint)readByte() << 8));
++			iVariantLowSet = (int)readByte();
++		}
++
++		const CPointMap pt((short)uiX, (short)uiY, 0, (uchar)(pChar->GetTopPoint().m_map));
++		if (!pt.IsValidPoint())
++			return true;
++
++		// Serpme katmanı (kum, çakıl, taş kırıntısı) zemine hiç dokunmaz: zeminin üstüne ayrı bir
++		// katman olarak serpilir, altındaki döşeme olduğu gibi kalır. z alanı yoğunluğu, setSize
++		// çeşitleme sayısını, wVariantMid de fırçanın bu vuruştaki tohumunu taşır.
++		if ((bTool == TERRAIN_TOOL_OVERLAY) || (bTool == TERRAIN_TOOL_OVERLAY_DEL))
++		{
++			const int iDensity = maximum(1, minimum(100, (int)(byte)iZValue));
++
++			if (CWorldMap::EditOverlayArea(pt, (word)uiTileId, iSetSize, iRadius, (bFlags & 0x01) != 0,
++				iDensity, iShape, wVariantMid, bTool == TERRAIN_TOOL_OVERLAY_DEL) <= 0)
++			{
++				client->SysMessage((bTool == TERRAIN_TOOL_OVERLAY_DEL) ? "Serpme: orada silinecek bir şey yok." : "Serpme: orası zaten dolu.");
++			}
++
++			return true;
++		}
++
++		if (CWorldMap::EditTerrainArea(pt, (int)bTool, (word)uiTileId, iZValue, iRadius, (bFlags & 0x01) != 0, iSoftness, iSetSize, iShape, wVariantMid, iVariantMidSet, wVariantLow, iVariantLowSet) <= 0)
++			client->SysMessage("Terrain: nothing to change there.");
++
++		return true;
++	}
++
++	// MyShard: sub-command 0xCB = the decoration brush: word x, word y, word item id, byte radius,
++	//  byte flags (bit 0 = square, bit 1 = erase), byte density, byte shape (all little-endian).
++	if ((byte)type == 0xCB)
++	{
++		CChar* pChar = client->GetChar();
++		if ((pChar == nullptr) || (packetLength < 14))
++			return true;
++
++		if (client->GetPrivLevel() < PLEVEL_GM)
++		{
++			client->SysMessage("You are not allowed to edit the terrain.");
++			return true;
++		}
++
++		const uint uiX = readByte() | ((uint)readByte() << 8);
++		const uint uiY = readByte() | ((uint)readByte() << 8);
++		const uint uiItemId = readByte() | ((uint)readByte() << 8);
++		const int iRadius = (int)readByte();
++		const byte bFlags = readByte();
++		const int iDensity = (int)readByte();
++		const int iShape = (int)readByte();
++
++		const CPointMap pt((short)uiX, (short)uiY, 0, (uchar)(pChar->GetTopPoint().m_map));
++		if (!pt.IsValidPoint())
++			return true;
++
++		const bool fErase = (bFlags & 0x02) != 0;
++		const int iDone = CWorldMap::EditStaticArea(pt, pChar, uiItemId, iRadius, (bFlags & 0x01) != 0, iDensity, iShape, fErase);
++
++		if (iDone <= 0)
++			client->SysMessage(fErase ? "Decoration: nothing of ours there." : "Decoration: nothing placed.");
++
++		return true;
++	}
++
++	// MyShard: sub-command 0xCC = terrain editor command without a brush: byte action (0 = undo, 1 = save).
++	if ((byte)type == 0xCC)
++	{
++		if ((client->GetChar() == nullptr) || (packetLength < 5))
++			return true;
++
++		if (client->GetPrivLevel() < PLEVEL_GM)
++		{
++			client->SysMessage("You are not allowed to edit the terrain.");
++			return true;
++		}
++
++		const byte bAction = readByte();
++
++		switch (bAction)
++		{
++			case 0:
++			{
++				const int iRestored = CWorldMap::UndoTerrainStroke();
++				if (iRestored > 0)
++					client->SysMessagef("Terrain: undone (%d tiles, %d strokes left).", iRestored, CWorldMap::GetTerrainUndoDepth());
++				else
++					client->SysMessage("Terrain: nothing left to undo.");
++				break;
++			}
++
++			case 1:
++				if (CWorldMap::SaveTerrainEdits())
++					client->SysMessage("Terrain: saved.");
++				else
++					client->SysMessage("Terrain: saving failed, see the console.");
++				break;
++
++			default:
++				break;
++		}
++
++		return true;
++	}
++
+ 	tchar name[MAX_TALK_BUFFER];
+ 	readStringNullASCII(name, MAX_TALK_BUFFER-1);
+ 
+diff --git a/src/network/send.cpp b/src/network/send.cpp
+index ceff92a5..347d0d54 100644
+--- a/src/network/send.cpp
++++ b/src/network/send.cpp
+@@ -3,6 +3,8 @@
+ //#include "../common/CExpression.h" // included in the precompiled header
+ #include "../common/CLog.h"
+ #include "../common/CUOInstall.h"
++#include "../common/CServerMapEdits.h"
++#include "../game/uo_files/CUOMapBlock.h"
+ #include "../game/chars/CChar.h"
+ #include "../game/components/CCItemDamageable.h"
+ #include "../game/components/CCPropsChar.h"
+@@ -1438,32 +1440,46 @@ PacketQueryClient::PacketQueryClient(CClient* target, byte bCmd) : PacketSend(XC
+ 		case 0x01:
+ 		{
+ 			//Update Map Definitions Command
+-			int length = 2 * 9; //map count * 9
+-            int count = length / 7;
+-            int padding = 0;
+-            if (length - (count * 7) > 0)
+-            {
+-                ++count;
+-                padding = (count * 7) - length;
+-            }
++			// Tell the client which maps exist and how big they are, so it can set up its own
++			// patched copies of the mul files (UltimaLive).
++			int iMaps[MAP_SUPPORTED_QTY];
++			int iMapQty = 0;
++			// Only map 0 for now. Every map we declare here is a map the client will replace with its own
++			// copy, using the size WE declare: if a mapX.mul is not exactly the size written in sphere.ini
++			// (which is the case for the secondary maps), the client ends up with a broken map.
++			for (int i = 0; i < 1; ++i)
++			{
++				if (g_MapList.IsMapSupported(i) && g_MapList.IsInitialized(i))
++					iMaps[iMapQty++] = i;
++			}
++
++			const int length = iMapQty * 9;	// map count * 9 bytes per map
++			int count = length / 7;
++			int padding = 0;
++			if (length - (count * 7) > 0)
++			{
++				++count;
++				padding = (count * 7) - length;
++			}
+ 
+ 			writeInt32(0);
+-			writeInt32(4);
++			writeInt32((dword)count);	// the client reads back the map count as count * 7 / 9
+ 			writeInt16(0);
+ 			writeByte(0x01);
+ 			writeByte(0);
+ 
+-			for (uchar i = 0; i < 2; ++i)
++			for (int i = 0; i < iMapQty; ++i)
+ 			{
+-				writeByte((byte)i);
+-				writeInt16((word)(g_MapList.GetMapSizeX(i)));
+-				writeInt16((word)(g_MapList.GetMapSizeY(i)));
+-				writeInt16((word)(g_MapList.GetMapSizeX(i)));
+-				writeInt16((word)(g_MapList.GetMapSizeY(i)));
+-            }
++				const int iMap = iMaps[i];
++				writeByte((byte)iMap);
++				writeInt16((word)(g_MapList.GetMapSizeX(iMap)));
++				writeInt16((word)(g_MapList.GetMapSizeY(iMap)));
++				writeInt16((word)(g_MapList.GetMapSizeX(iMap)));
++				writeInt16((word)(g_MapList.GetMapSizeY(iMap)));
++			}
+ 
+-            for (int i = 0; i < padding; ++i)
+-                writeByte(0);
++			for (int i = 0; i < padding; ++i)
++				writeByte(0);
+ 
+ 			break;
+ 		}
+@@ -1494,7 +1510,7 @@ PacketQueryClient::PacketQueryClient(CClient* target, byte bCmd) : PacketSend(XC
+             const CChar* pChar = target->GetChar();
+ 			byte bMap = pChar->GetTopMap();
+ 			CPointMap pt = pChar->GetTopPoint();
+-			dword dwBlockId = (pt.m_x * (g_MapList.GetMapSizeY( bMap ) / UO_BLOCK_SIZE)) + pt.m_y;
++			const dword dwBlockId = dword((pt.m_x / UO_BLOCK_SIZE) * (g_MapList.GetMapSizeY( bMap ) / UO_BLOCK_SIZE)) + dword(pt.m_y / UO_BLOCK_SIZE);
+ 			writeInt32(dwBlockId);
+ 			writeInt32(0);
+ 			writeInt16(0);
+@@ -1508,6 +1524,57 @@ PacketQueryClient::PacketQueryClient(CClient* target, byte bCmd) : PacketSend(XC
+ }
+ 
+ 
++/***************************************************************************
++ *
++ *
++ *	Packet 0x40 : PacketUpdateTerrain		UltimaLive terrain block update (NORMAL)
++ *
++ *
++ ***************************************************************************/
++PacketUpdateTerrain::PacketUpdateTerrain(const CClient* target, dword dwBlockIdx, const CUOMapBlock* pBlock, byte bMap) : PacketSend(XCMD_UpdateTerrain, 201, PRI_NORMAL)
++{
++	ADDTOCALLSTACK("PacketUpdateTerrain::PacketUpdateTerrain");
++	// Fixed size packet: 0x40 + block index (4) + terrain data (192) + padding (3) + map (1) = 201 bytes.
++	ASSERT(pBlock != nullptr);
++
++	writeInt32(dwBlockIdx);
++	writeData(reinterpret_cast<const byte*>(pBlock->m_Meter), sizeof(pBlock->m_Meter));	// 8x8 meters, 192 bytes
++	writeByte(0);
++	writeByte(0);
++	writeByte(0);
++	writeByte(bMap);
++
++	push(target);
++}
++
++/***************************************************************************
++ *
++ *
++ *	Packet 0x3F alt komut 0xF0 : PacketUpdateTerrainOverlay	serpme katmanı bloğu (NORMAL)
++ *
++ *
++ ***************************************************************************/
++PacketUpdateTerrainOverlay::PacketUpdateTerrainOverlay(const CClient* target, dword dwBlockIdx, const CMapOverlayBlock* pBlock, byte bMap) : PacketSend(XCMD_StaticUpdate, 143, PRI_NORMAL)
++{
++	ADDTOCALLSTACK("PacketUpdateTerrainOverlay::PacketUpdateTerrainOverlay");
++	// Serpme katmanı mul verisi değil: zeminin üstüne çizilen ek grafikler. UltimaLive'ın 0x3F paketine
++	// kendi alt komutumuzla biniyor, böylece istemcinin harita dosyalarına hiç dokunmadan taşınıyor.
++	// 0x3F + uzunluk(2) + blok(4) + 0(4) + 0(2) + 0xF0 + harita(1) + 64 word = 143 bayt.
++	ASSERT(pBlock != nullptr);
++
++	initLength();
++	writeInt32(dwBlockIdx);
++	writeInt32(0);
++	writeInt16(0);
++	writeByte(0xF0);
++	writeByte(bMap);
++
++	for (int i = 0; i < (UO_BLOCK_SIZE * UO_BLOCK_SIZE); ++i)
++		writeInt16(pBlock->m_wTile[i]);
++
++	push(target);
++}
++
+ /***************************************************************************
+  *
+  *
+diff --git a/src/network/send.h b/src/network/send.h
+index b91b9030..e8055235 100644
+--- a/src/network/send.h
++++ b/src/network/send.h
+@@ -15,6 +15,7 @@
+ 
+ 
+ struct CMenuItem;
++struct CUOMapBlock;
+ struct CRectMap;
+ class CNetState;
+ class CItemMap;
+@@ -477,6 +478,34 @@ public:
+ 
+ };
+ 
++/***************************************************************************
++ *
++ *
++ *	Packet 0x40 : PacketUpdateTerrain		UltimaLive terrain block update (NORMAL)
++ *
++ *
++ ***************************************************************************/
++
++/***************************************************************************
++ *
++ *
++ *	Packet 0x3F : PacketUpdateTerrainOverlay	MyShard serpme katmanı bloğu (NORMAL)
++ *
++ *
++ ***************************************************************************/
++struct CMapOverlayBlock;
++class PacketUpdateTerrainOverlay : public PacketSend
++{
++public:
++	PacketUpdateTerrainOverlay(const CClient* target, dword dwBlockIdx, const CMapOverlayBlock* pBlock, byte bMap);
++};
++
++class PacketUpdateTerrain : public PacketSend
++{
++public:
++	PacketUpdateTerrain(const CClient* target, dword dwBlockIdx, const CUOMapBlock* pBlock, byte bMap);
++};
++
+ /***************************************************************************
+  *
+  *
+diff --git a/src/tables/CClient_functions.tbl b/src/tables/CClient_functions.tbl
+index ddc1fa22..7277848b 100644
+--- a/src/tables/CClient_functions.tbl
++++ b/src/tables/CClient_functions.tbl
+@@ -63,6 +63,7 @@ ADD(SYSMESSAGELOC,	"SYSMESSAGELOC")
+ ADD(SYSMESSAGELOCEX,"SYSMESSAGELOCEX")
+ ADD(SYSMESSAGEUA,	"SYSMESSAGEUA")
+ ADD(TELE,			"TELE")
++ADD(TERRAIN,		"TERRAIN")
+ ADD(TILE,			"TILE")
+ ADD(UNEXTRACT,		"UNEXTRACT")
+ ADD(VERSION,		"VERSION")
